@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import time
 from pathlib import Path
 
@@ -22,12 +23,32 @@ def pick_device() -> torch.device:
     return torch.device("cpu")
 
 
-def make_loaders(train_ds, val_ds, batch_size=C.BATCH_SIZE, num_workers=0):
+def seed_worker(worker_id: int) -> None:
+    """Re-seed numpy and stdlib random inside each DataLoader worker.
+
+    PyTorch seeds each worker's torch RNG automatically, but NOT numpy's or
+    random's. macOS spawns workers, so each starts with a fresh numpy RNG seeded
+    from entropy -- meaning any numpy-based augmentation would be
+    non-reproducible even with a global seed set. Harmless at num_workers=0 (the
+    measured-best default) but required for the flag to be usable.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_loaders(train_ds, val_ds, batch_size=C.BATCH_SIZE, num_workers=0,
+                 generator=None):
     """num_workers=0 is the measured-best default here.
 
     Features are precomputed, so a sample is just a small HDF5 read: single-process
     loading measures ~2,500 samples/s against the model's ~66 samples/s on MPS, so
     the loader is 38x faster than the GPU and workers add only spawn overhead.
+
+    `generator` seeds the shuffle independently of the global torch RNG. Without
+    it the loader draws from the same RNG that SpecAugment consumes inside
+    __getitem__, so batch order would depend on how many augmentation draws had
+    happened -- changing SPEC_N_MASKS would silently change the batch order too.
     """
     common = dict(
         batch_size=batch_size,
@@ -36,8 +57,10 @@ def make_loaders(train_ds, val_ds, batch_size=C.BATCH_SIZE, num_workers=0):
         # Apple unified memory there is no such copy, so it is pure overhead.
         pin_memory=False,
         persistent_workers=num_workers > 0,
+        worker_init_fn=seed_worker if num_workers > 0 else None,
     )
-    train_loader = DataLoader(train_ds, shuffle=True, drop_last=True, **common)
+    train_loader = DataLoader(train_ds, shuffle=True, drop_last=True,
+                              generator=generator, **common)
     val_loader = DataLoader(val_ds, shuffle=False, **common)
     return train_loader, val_loader
 
@@ -119,7 +142,8 @@ def build_scheduler(optimiser, kind, epochs, steps_per_epoch, log=print):
 def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
           lr=C.LR, weight_decay=C.WEIGHT_DECAY, batch_size=C.BATCH_SIZE,
           num_workers=0, patience=C.EARLY_STOP_PATIENCE, loss_name="bce",
-          use_mixup=True, lr_schedule=C.LR_SCHEDULE, out_dir=None, log=print):
+          use_mixup=True, mixup_p=C.MIXUP_P, grad_clip=C.GRAD_CLIP,
+          lr_schedule=C.LR_SCHEDULE, seed=C.SEED, out_dir=None, log=print):
     device = pick_device()
     model = model.to(device)
     out_dir = Path(out_dir or (C.RUNS_DIR / arm))
@@ -159,7 +183,16 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
     log(f"weight decay {weight_decay} on {len(decay)} tensors, "
         f"0.0 on {len(no_decay)} (BN/bias/fusion)")
 
-    train_loader, val_loader = make_loaders(train_ds, val_ds, batch_size, num_workers)
+    # Dedicated generator so shuffle order is reproducible and INDEPENDENT of how
+    # many draws SpecAugment takes from the global RNG.
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(seed)
+    train_loader, val_loader = make_loaders(train_ds, val_ds, batch_size,
+                                            num_workers, generator=loader_gen)
+
+    # MixUp's lambda comes from np.random, so give it its own stream too rather
+    # than letting call count depend on unrelated numpy use elsewhere.
+    mixup_rng = np.random.default_rng(seed)
 
     scheduler, sched_step = build_scheduler(
         optimiser, lr_schedule, epochs, len(train_loader), log=log,
@@ -167,7 +200,9 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
 
     log(f"arm={arm}  device={device}  params={sum(p.numel() for p in model.parameters()):,}")
     log(f"train={len(train_ds):,} clips  val={len(val_ds):,} clips  "
-        f"batch={batch_size}  loss={loss_name}  mixup={use_mixup}")
+        f"batch={batch_size}  loss={loss_name}  seed={seed}")
+    log(f"mixup={use_mixup} (p={mixup_p}, alpha={C.MIXUP_ALPHA})  "
+        f"grad_clip={grad_clip or 'off'}")
 
     # Cosine anneals to its floor at exactly `epochs`, so early stopping mid-cosine
     # discards the low-lr phase where convergence actually happens -- the schedule
@@ -185,15 +220,24 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
     for epoch in range(1, epochs + 1):
         model.train()
         t0 = time.perf_counter()
-        running, n_batches = 0.0, 0
+        running, n_batches, n_mixed, grad_sum = 0.0, 0, 0, 0.0
 
         for batch in train_loader:
-            if use_mixup:
-                batch = mixup(batch)
+            # Gated: mixing every batch on top of SpecAugment corrupts every sample
+            # twice. See config.MIXUP_P.
+            if use_mixup and mixup_rng.random() < mixup_p:
+                batch = mixup(batch, rng=mixup_rng)
+                n_mixed += 1
             logits, y = _forward(model, batch, device, arm)
             loss = criterion(logits, y)
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
+            # Clip BEFORE step, AFTER backward -- the only valid position.
+            if grad_clip:
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), grad_clip,
+                )
+                grad_sum += float(total_norm)
             optimiser.step()
             # AFTER optimiser.step(), per PyTorch's documented order. Calling it
             # before would apply epoch N+1's lr to epoch N's final update and emit
@@ -221,13 +265,19 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
             "val_macro_f1": res["macro_f1"],
             "fusion_a": model.fusion_weight,
             "lr": current_lr,
+            # Mean pre-clip gradient norm. If this sits far above grad_clip the
+            # clipper is firing constantly and is silently rescaling every step,
+            # which changes the effective lr -- worth knowing rather than guessing.
+            "grad_norm": grad_sum / max(n_batches, 1) if grad_clip else None,
+            "frac_mixed": n_mixed / max(n_batches, 1),
             "train_s": round(train_time, 1),
             "epoch_s": round(epoch_time, 1),
         }
         history.append(row)
+        gn = f" gnorm={row['grad_norm']:.2f}" if row["grad_norm"] is not None else ""
         log(f"epoch {epoch:3d}  loss {row['train_loss']:.4f}  val_mAP {res['mAP']:.4f}  "
             f"macro_f1 {res['macro_f1']:.4f}  a={row['fusion_a']:.3f}  "
-            f"lr={current_lr:.2e}  {epoch_time:.0f}s")
+            f"lr={current_lr:.2e}{gn}  {epoch_time:.0f}s")
 
         if res["mAP"] > best["mAP"]:
             best = {"mAP": res["mAP"], "epoch": epoch}
@@ -282,6 +332,9 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
         "lr_schedule": lr_schedule,
         "lr_final": history[-1]["lr"] if history else None,
         "epochs_run": len(history),
+        "seed": seed,
+        "mixup_p": mixup_p if use_mixup else 0.0,
+        "grad_clip": grad_clip,
         "per_class_ap": res["per_class_ap"],
         "threshold_fallbacks": fell_back,
     }, indent=2))

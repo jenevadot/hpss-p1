@@ -91,6 +91,21 @@ SPEC_FREQ_MASK = 8
 SPEC_N_MASKS = 2
 MIXUP_ALPHA = 0.2
 
+# Probability that a given batch gets mixed. The seed-42 runs applied MixUp to
+# 100% of batches on top of SpecAugment on 100% of samples, so every sample the
+# model ever saw was corrupted twice. That is consistent with what was measured:
+# train loss plateaued at 0.053 with NO train/val divergence across 31 epochs, i.e.
+# the model was augmentation-limited rather than capacity-limited. A gate at 0.5
+# lets the model also see clean-ish samples. Set to 1.0 to recover the old
+# behaviour.
+MIXUP_P = 0.5
+
+# Gradient-norm clipping. Cheap insurance rather than a fix for an observed
+# explosion: with BN everywhere and Adam the gradients are well-behaved, but the
+# ultra-rare classes (LEPFLA has 7 positives in 62,191 clips) contribute large,
+# sparse gradients when they do appear. 0 disables.
+GRAD_CLIP = 1.0
+
 # ---------------------------------------------------------------- architecture
 # Stem downsample factor applied BEFORE block 1 (1 = the literal reading of the
 # paper's text, i.e. no stem pool).

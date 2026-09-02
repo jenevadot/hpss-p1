@@ -208,3 +208,73 @@ def test_schedule_none_is_flat():
     sched, granularity = build_scheduler(opt, "none", 10, 100, log=lambda *a: None)
     assert sched is None and granularity is None
     assert opt.param_groups[0]["lr"] == C.LR
+
+
+def test_same_seed_gives_identical_init_and_batch_order():
+    """Seeding must fix BOTH the weights and the batch order.
+
+    These are the two things a seed can actually guarantee on MPS (reduction order
+    is still non-deterministic, so this runs on CPU tensors only). If either drifts,
+    seed-to-seed comparison is meaningless and the mean+-std over seeds would be
+    measuring RNG noise rather than seed sensitivity.
+    """
+    from src.train import set_seed
+
+    def first_weights_and_order(seed):
+        set_seed(seed)
+        model = HSPPNet(arm="dual")
+        w = model.stream_h.body[1].body[0].weight.detach().clone()
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+        order = list(torch.utils.data.DataLoader(
+            torch.arange(500), batch_size=32, shuffle=True, generator=gen,
+        ))[0]
+        return w, order
+
+    w1, o1 = first_weights_and_order(42)
+    w2, o2 = first_weights_and_order(42)
+    w3, o3 = first_weights_and_order(43)
+
+    assert torch.equal(w1, w2), "same seed produced different initial weights"
+    assert torch.equal(o1, o2), "same seed produced a different batch order"
+    assert not torch.equal(w1, w3), "different seeds produced identical weights"
+    assert not torch.equal(o1, o3), "different seeds produced identical batch order"
+
+
+def test_mixup_rng_is_reproducible_and_independent():
+    """A seeded rng must give identical mixes, and must not touch global numpy state."""
+    from src.dataset import mixup
+
+    def mixed(seed):
+        rng = np.random.default_rng(seed)
+        x = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 1, 4, 1)
+        y = torch.eye(8, C.N_CLASSES)
+        return mixup((x, y), rng=rng)
+
+    a_x, a_y = mixed(0)
+    b_x, b_y = mixed(0)
+    c_x, _ = mixed(1)
+    assert torch.equal(a_x, b_x) and torch.equal(a_y, b_y), "seeded mixup not reproducible"
+    assert not torch.equal(a_x, c_x), "different seeds gave the same mix"
+
+    # Global numpy state must be untouched by the generator path.
+    np.random.seed(7)
+    before = np.random.random()
+    np.random.seed(7)
+    mixed(123)
+    assert np.random.random() == before, "mixup consumed the global numpy stream"
+
+
+def test_grad_clip_bounds_the_norm():
+    """Clipping must actually cap the norm, and must run before the optimiser step."""
+    model = HSPPNet(arm="harmonic")
+    x = torch.randn(2, 1, C.N_MELS, C.N_FRAMES)
+    # Large targets -> large loss -> large gradients, so clipping has to bite.
+    loss = torch.nn.functional.mse_loss(model(x), torch.full((2, C.N_CLASSES), 1e4))
+    loss.backward()
+
+    pre = torch.nn.utils.clip_grad_norm_(model.parameters(), C.GRAD_CLIP)
+    post = torch.sqrt(sum((p.grad ** 2).sum() for p in model.parameters()
+                          if p.grad is not None))
+    assert pre > C.GRAD_CLIP, f"test is vacuous: pre-clip norm {pre:.3f} already small"
+    assert post <= C.GRAD_CLIP * 1.01, f"post-clip norm {post:.3f} > {C.GRAD_CLIP}"

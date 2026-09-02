@@ -21,9 +21,17 @@ from . import config as C
 class AsymConvBlock(nn.Module):
     """Cascaded 3x5 then 5x3 convolution, each followed by BN + ReLU.
 
-    3x5 extends the receptive field along frequency (harmonic overtone spacing);
-    5x3 extends it along time (onset-sustain-decay dynamics). Together they cover
-    an effective 7x7 field using 30 multiply-accumulates per position instead of 49.
+    Tensor layout is (B, C, n_mels, n_frames), so dim 2 is FREQUENCY and dim 3 is
+    TIME. Therefore:
+      (3, 5) -- 3 along frequency, 5 along time: a TIME-extended kernel that sees
+                onset-sustain-decay dynamics.
+      (5, 3) -- 5 along frequency, 3 along time: a FREQUENCY-extended kernel that
+                sees harmonic overtone spacing.
+    Together they cover an effective 7x7 field using 30 multiply-accumulates per
+    position instead of 49, plus an extra nonlinearity in between.
+
+    Only partially factorised (3x5, not 1x5) on purpose: full separability would
+    lose the joint T-F sensitivity that diagonal frequency sweeps need.
     """
 
     def __init__(self, c_in: int, c_out: int):

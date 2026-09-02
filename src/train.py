@@ -50,19 +50,6 @@ def set_seed(seed: int) -> None:
         torch.mps.manual_seed(seed)
 
 
-def seeded_generator(seed: int) -> torch.Generator:
-    """Dedicated generator for DataLoader shuffling.
-
-    Without this the loader draws from the global torch RNG, which is also consumed
-    by SpecAugment inside __getitem__. Batch order would then depend on how many
-    augmentation draws happened, coupling two things that should be independent --
-    so changing SPEC_N_MASKS would silently change the batch order too.
-    """
-    g = torch.Generator()
-    g.manual_seed(seed)
-    return g
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", default="dual", choices=HSPPNet.ARMS)
@@ -82,6 +69,10 @@ def main():
     ap.add_argument("--lr-schedule", default=C.LR_SCHEDULE,
                     choices=["cosine", "plateau", "none"],
                     help="'none' reproduces the paper's flat lr")
+    ap.add_argument("--mixup-p", type=float, default=C.MIXUP_P,
+                    help="fraction of batches to mix (1.0 = the old always-on behaviour)")
+    ap.add_argument("--grad-clip", type=float, default=C.GRAD_CLIP,
+                    help="max gradient norm; 0 disables")
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -103,7 +94,8 @@ def main():
         epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
         num_workers=args.num_workers, patience=args.patience,
         loss_name=args.loss, use_mixup=not args.no_mixup,
-        lr_schedule=args.lr_schedule, out_dir=out_dir,
+        mixup_p=args.mixup_p, grad_clip=args.grad_clip,
+        lr_schedule=args.lr_schedule, seed=args.seed, out_dir=out_dir,
     )
     print(f"\nartifacts in {out_dir}")
 

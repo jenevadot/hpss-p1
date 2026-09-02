@@ -82,6 +82,13 @@ def spec_augment(x: torch.Tensor) -> torch.Tensor:
     Widths are deliberately smaller than the paper's (time 40, freq 8): at 130
     frames a 40-frame mask is 31% of the clip and two of them can erase 60% of a
     frog call. See config.SPEC_TIME_MASK.
+
+    Masks are filled with 0.0, which -- because this runs AFTER normalisation --
+    is the train-split MEAN energy (mean=-27.6 dB), not silence. Silence would be
+    about (-80 - -27.6)/13.6 = -3.87. Mean-filling is the original SpecAugment
+    recommendation and is the better choice here: a mean-filled patch reads as
+    "uninformative", whereas a silence-filled patch asserts "confidently empty",
+    which is a stronger and more misleading claim for a detection task.
     """
     x = x.clone()
     _, n_mels, n_frames = x.shape
@@ -97,22 +104,41 @@ def spec_augment(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def mixup(batch, alpha: float = C.MIXUP_ALPHA):
+def mixup(batch, alpha: float = C.MIXUP_ALPHA, rng=None):
     """Multi-label MixUp: mix inputs and targets with the SAME lambda.
 
     BCE accepts soft targets, so this needs no other change. Applied after
     SpecAugment; must be disabled at eval.
+
+    `rng` is a np.random.Generator so lambda draws are reproducible and do not
+    depend on unrelated global numpy state. Falls back to the legacy global RNG
+    when None, which keeps older call sites working.
+
+    One lambda per batch (not per sample), matching the original MixUp. The
+    permutation shares that lambda, so a batch is mixed with a shuffle of itself.
     """
     *xs, y = batch
-    lam = float(np.random.beta(alpha, alpha))
-    perm = torch.randperm(y.size(0))
+    if rng is None:
+        lam = float(np.random.beta(alpha, alpha))
+        perm = torch.randperm(y.size(0))
+    else:
+        lam = float(rng.beta(alpha, alpha))
+        # Derive the permutation from the same stream so a single seed fixes both.
+        perm = torch.from_numpy(rng.permutation(y.size(0))).long()
     xs = [lam * x + (1.0 - lam) * x[perm] for x in xs]
     y = lam * y + (1.0 - lam) * y[perm]
     return (*xs, y)
 
 
 def compute_norm_stats(filenames, arm="dual", h5_path=None, sample=4000):
-    """Global mean/std over a sample of the TRAIN split only (never val/test)."""
+    """Global mean/std over a sample of the TRAIN split only (never val/test).
+
+    The np.linspace subsample is SYSTEMATIC over sorted (i.e. chronological, by
+    site/date) HDF5 rows, not random. For a single global scalar over 4,000 x 128 x
+    130 = 66.6M values that is fine and arguably better stratified across the
+    recording timeline than a random draw. It would NOT be safe for a per-mel-bin
+    statistic: any periodicity in row order could alias with the sampling stride.
+    """
     h5_path = str(h5_path or C.FEATURES_H5)
     with h5py.File(h5_path, "r") as h5:
         all_names = [n.decode() for n in h5["filenames"][:]]
