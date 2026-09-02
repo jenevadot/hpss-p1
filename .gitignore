@@ -1,0 +1,11 @@
+.venv/
+data/train/
+data/test/
+data/features.h5
+data/_*.h5
+runs/
+*.7z
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
