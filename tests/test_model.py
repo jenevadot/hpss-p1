@@ -266,15 +266,21 @@ def test_mixup_rng_is_reproducible_and_independent():
 
 
 def test_grad_clip_bounds_the_norm():
-    """Clipping must actually cap the norm, and must run before the optimiser step."""
+    """Clipping must cap the norm when enabled.
+
+    Uses an explicit threshold rather than C.GRAD_CLIP: the default is 0 (off,
+    because the measured norm is ~0.13 so 1.0 never fired), but the mechanism still
+    has to be correct for when --grad-clip is passed.
+    """
+    limit = 0.5
     model = HSPPNet(arm="harmonic")
     x = torch.randn(2, 1, C.N_MELS, C.N_FRAMES)
     # Large targets -> large loss -> large gradients, so clipping has to bite.
     loss = torch.nn.functional.mse_loss(model(x), torch.full((2, C.N_CLASSES), 1e4))
     loss.backward()
 
-    pre = torch.nn.utils.clip_grad_norm_(model.parameters(), C.GRAD_CLIP)
+    pre = torch.nn.utils.clip_grad_norm_(model.parameters(), limit)
     post = torch.sqrt(sum((p.grad ** 2).sum() for p in model.parameters()
                           if p.grad is not None))
-    assert pre > C.GRAD_CLIP, f"test is vacuous: pre-clip norm {pre:.3f} already small"
-    assert post <= C.GRAD_CLIP * 1.01, f"post-clip norm {post:.3f} > {C.GRAD_CLIP}"
+    assert pre > limit, f"test is vacuous: pre-clip norm {pre:.3f} already below {limit}"
+    assert post <= limit * 1.01, f"post-clip norm {post:.3f} > {limit}"

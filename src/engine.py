@@ -220,7 +220,7 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
     for epoch in range(1, epochs + 1):
         model.train()
         t0 = time.perf_counter()
-        running, n_batches, n_mixed, grad_sum = 0.0, 0, 0, 0.0
+        running, n_batches, n_mixed, grad_sum, n_grad = 0.0, 0, 0, 0.0, 0
 
         for batch in train_loader:
             # Gated: mixing every batch on top of SpecAugment corrupts every sample
@@ -233,11 +233,22 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
             # Clip BEFORE step, AFTER backward -- the only valid position.
+            # When clipping is off, still measure the norm on a sparse sample of
+            # steps: grad_norm is the signal that says whether clipping is needed
+            # at all, so losing it would make GRAD_CLIP=0 an unmonitored choice.
+            # Every 50th step costs <1% and is plenty for a per-epoch mean.
             if grad_clip:
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), grad_clip,
                 )
                 grad_sum += float(total_norm)
+                n_grad += 1
+            elif n_batches % 50 == 0:
+                with torch.no_grad():
+                    sq = sum((p.grad.detach() ** 2).sum()
+                             for p in model.parameters() if p.grad is not None)
+                    grad_sum += float(sq.sqrt())
+                n_grad += 1
             optimiser.step()
             # AFTER optimiser.step(), per PyTorch's documented order. Calling it
             # before would apply epoch N+1's lr to epoch N's final update and emit
@@ -265,10 +276,11 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
             "val_macro_f1": res["macro_f1"],
             "fusion_a": model.fusion_weight,
             "lr": current_lr,
-            # Mean pre-clip gradient norm. If this sits far above grad_clip the
-            # clipper is firing constantly and is silently rescaling every step,
-            # which changes the effective lr -- worth knowing rather than guessing.
-            "grad_norm": grad_sum / max(n_batches, 1) if grad_clip else None,
+            # Mean pre-clip gradient norm (sampled every 50th step when clipping is
+            # off). If this climbs toward grad_clip the clipper is firing constantly
+            # and silently rescaling every step, which changes the effective lr --
+            # worth knowing rather than guessing. Measured ~0.13 on the dual arm.
+            "grad_norm": grad_sum / n_grad if n_grad else None,
             "frac_mixed": n_mixed / max(n_batches, 1),
             "train_s": round(train_time, 1),
             "epoch_s": round(epoch_time, 1),

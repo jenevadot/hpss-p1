@@ -100,11 +100,13 @@ MIXUP_ALPHA = 0.2
 # behaviour.
 MIXUP_P = 0.5
 
-# Gradient-norm clipping. Cheap insurance rather than a fix for an observed
-# explosion: with BN everywhere and Adam the gradients are well-behaved, but the
-# ultra-rare classes (LEPFLA has 7 positives in 62,191 clips) contribute large,
-# sparse gradients when they do appear. 0 disables.
-GRAD_CLIP = 1.0
+# Gradient-norm clipping. MEASURED: the mean pre-clip norm is ~0.13 on the dual
+# arm, so a threshold of 1.0 never fires -- it was paying ~16% per step
+# (241 -> 280 ms, benchmarked in isolation) for a no-op. Set to 0 by default and
+# left as a flag: with BN everywhere and AdamW the gradients are well-behaved, and
+# `grad_norm` is logged every epoch so a real explosion is visible immediately.
+# If grad_norm ever climbs toward 1, re-enable with --grad-clip 0.5.
+GRAD_CLIP = 0.0
 
 # ---------------------------------------------------------------- architecture
 # Stem downsample factor applied BEFORE block 1 (1 = the literal reading of the
