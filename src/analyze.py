@@ -54,11 +54,16 @@ def collect_runs() -> pd.DataFrame:
 
 
 def _config_key(row) -> str:
-    """Runs are only comparable within one config. Missing fields = a legacy run."""
-    if row["stem_pool"] is None:
+    """Runs are only comparable within one config. Missing fields = a legacy run.
+
+    Fusion is deliberately NOT part of the key: single-stream arms have no fusion at
+    all, so including it would split one ablation ladder across two blocks and make
+    the arms non-comparable to each other -- the opposite of what the grouping is
+    for. Fusion is reported per-run in the `a` column instead.
+    """
+    if row["stem_pool"] is None or pd.isna(row["stem_pool"]):
         return "legacy (pre-stem-pool, flat lr, Adam, scalar fusion)"
-    fusion = "per-class" if row["per_class_fusion"] else "scalar"
-    return (f"stem/{row['stem_pool']}  {fusion} fusion  lr={row['lr_schedule']}")
+    return f"stem/{int(row['stem_pool'])}  lr={row['lr_schedule']}"
 
 
 def ablation_table() -> str:
@@ -73,7 +78,7 @@ def ablation_table() -> str:
     out = []
     for config, grp in df.groupby("config", sort=True):
         grp = grp.sort_values(["_o", "run"])
-        seeds = sorted({s for s in grp["seed"] if s is not None})
+        seeds = sorted({int(s) for s in grp["seed"] if s is not None and not pd.isna(s)})
         out += [
             f"=== {config} ===",
             f"seeds: {seeds or 'unrecorded'}",
