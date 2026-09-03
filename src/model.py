@@ -138,7 +138,8 @@ class HSPPNet(nn.Module):
     ARMS = ("dual", "harmonic", "percussive", "raw")
 
     def __init__(self, n_classes: int = C.N_CLASSES, arm: str = "dual",
-                 dropout: float = 0.5, per_class_fusion: bool | None = None):
+                 dropout: float = 0.5, per_class_fusion: bool | None = None,
+                 alpha_tau: float | None = None):
         super().__init__()
         if arm not in self.ARMS:
             raise ValueError(f"arm must be one of {self.ARMS}, got {arm!r}")
@@ -146,6 +147,11 @@ class HSPPNet(nn.Module):
         # default binding making config overrides silently ineffective.
         if per_class_fusion is None:
             per_class_fusion = C.PER_CLASS_FUSION
+        if alpha_tau is None:
+            alpha_tau = C.ALPHA_TAU
+        if alpha_tau <= 0:
+            raise ValueError(f"alpha_tau must be > 0, got {alpha_tau}")
+        self.alpha_tau = float(alpha_tau)
         self.arm = arm
         self.dual = arm == "dual"
         self.n_classes = n_classes
@@ -176,6 +182,15 @@ class HSPPNet(nn.Module):
             nn.Linear(256, n_classes),
         )
 
+    def _alpha(self) -> torch.Tensor:
+        """Fusion weight(s) in (0,1). Single definition, used everywhere.
+
+        Temperature is applied here so `forward`, `fusion_weight` and
+        `fusion_weights()` cannot disagree -- a mismatch would make the logged alpha
+        a different quantity from the one actually used to fuse.
+        """
+        return torch.sigmoid(self.a_raw / self.alpha_tau)
+
     @property
     def fusion_weight(self) -> float:
         """Mean value of a -- kept scalar so history.json stays comparable.
@@ -187,13 +202,13 @@ class HSPPNet(nn.Module):
         """
         if not self.dual:
             return float("nan")
-        return torch.sigmoid(self.a_raw).mean().item()
+        return self._alpha().mean().item()
 
     def fusion_weights(self) -> list[float]:
         """Per-class a values, aligned with config.SPECIES. Length 1 if scalar."""
         if not self.dual:
             return []
-        return torch.sigmoid(self.a_raw).detach().cpu().flatten().tolist()
+        return self._alpha().detach().cpu().flatten().tolist()
 
     def _branch(self, x, stream, spatial, channel):
         m = stream(x)              # (B, 512, H, W)
@@ -210,7 +225,7 @@ class HSPPNet(nn.Module):
         if x_p is None:
             raise ValueError("dual arm requires the percussive input x_p")
         f_p = self._branch(x_p, self.stream_p, self.spatial_p, self.channel_p)
-        a = torch.sigmoid(self.a_raw)
+        a = self._alpha()
 
         if self.per_class_fusion:
             # LOGIT-level fusion. A per-class weight cannot act on the pre-head

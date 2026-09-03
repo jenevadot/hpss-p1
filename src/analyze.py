@@ -296,16 +296,94 @@ def recording_diagnostics(run_name: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def tuning_table() -> str:
+    """One-factor-at-a-time tuning results, ranked by DEV mAP.
+
+    Selection rule, pre-registered in run_tuning.sh: the winner of each factor is
+    the highest dev_mAP. val is shown for transparency but MUST NOT drive the
+    choice -- with no labelled test set it is the only held-out estimate left, and
+    selecting on it would spend the very credibility it exists to provide.
+    """
+    rows = []
+    for run in sorted(C.RUNS_DIR.glob("tune_*/summary.json")):
+        s = json.loads(run.read_text())
+        rows.append({
+            "run": run.parent.name.replace("tune_", ""),
+            "dev_mAP": s.get("dev_mAP"),
+            "dev_macro_f1": s.get("dev_macro_f1_tuned"),
+            "val_mAP": s["val_mAP"],
+            "val_macro_f1": s["val_macro_f1_tuned"],
+            "gap": s.get("dev_to_val_gap"),
+            "epochs_run": s.get("epochs_run"),
+            "best_epoch": s["best_epoch"],
+            "alpha_tau": s.get("alpha_tau"),
+            "alpha_lr_mult": s.get("alpha_lr_mult"),
+            "mixup_p": s.get("mixup_p"),
+            "a_mean": s.get("fusion_a"),
+            "sel": s.get("selection_split"),
+        })
+    if not rows:
+        return "no tuning runs found under runs/tune_*/summary.json"
+
+    df = pd.DataFrame(rows)
+    stale = df[df["sel"] != "dev"]
+    df = df[df["sel"] == "dev"].sort_values("dev_mAP", ascending=False)
+
+    lines = [
+        "Pre-registered tuning sweep -- ranked by DEV mAP (the selection metric)",
+        "",
+        f"{'run':16s} {'dev_mAP':>8s} {'dev_F1':>7s} | {'val_mAP':>8s} {'val_F1':>7s} "
+        f"{'gap':>7s} {'ep':>4s} {'a':>6s}",
+    ]
+    for _, r in df.iterrows():
+        gap = f"{r['gap']:+.4f}" if r["gap"] is not None else "    -  "
+        a = f"{r['a_mean']:.3f}" if r["a_mean"] and not np.isnan(r["a_mean"]) else "  -  "
+        lines.append(
+            f"{r['run']:16s} {r['dev_mAP']:8.4f} {r['dev_macro_f1']:7.4f} | "
+            f"{r['val_mAP']:8.4f} {r['val_macro_f1']:7.4f} {gap:>7s} "
+            f"{int(r['best_epoch']):4d} {a:>6s}")
+
+    if not df.empty:
+        best = df.iloc[0]
+        lines += [
+            "",
+            f"WINNER by dev_mAP: {best['run']}  (dev {best['dev_mAP']:.4f})",
+        ]
+        base = df[df["run"] == "base"]
+        if not base.empty and best["run"] != "base":
+            b = base.iloc[0]
+            lines.append(
+                f"  vs base: dev {best['dev_mAP'] - b['dev_mAP']:+.4f}, "
+                f"val {best['val_mAP'] - b['val_mAP']:+.4f}")
+            lines.append(
+                "  NOTE single seed -- a dev gain below ~0.008 is inside the seed "
+                "noise measured on the 3-seed ladder (mean sd 0.0078).")
+
+    if not stale.empty:
+        lines += ["", "excluded (selected on val, not dev -- not comparable): "
+                  + ", ".join(stale["run"].tolist())]
+    lines += [
+        "",
+        "dev drives selection. val is shown for transparency only; it is read once",
+        "per run with dev-fitted thresholds and must not be used to choose.",
+    ]
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--complexity", action="store_true")
     ap.add_argument("--per-class", metavar="RUN")
+    ap.add_argument("--tuning", action="store_true",
+                    help="pre-registered tuning sweep, ranked by dev mAP")
     ap.add_argument("--recordings", nargs="?", const="", metavar="RUN",
                     help="per-class clip/recording support; pass a run name for APs")
     args = ap.parse_args()
 
     if args.complexity:
         print(complexity_table())
+    elif args.tuning:
+        print(tuning_table())
     elif args.per_class:
         print(per_class(args.per_class))
     elif args.recordings is not None:

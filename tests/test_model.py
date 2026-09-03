@@ -4,7 +4,10 @@
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
+import pytest
 import torch
 
 from src import config as C
@@ -284,3 +287,79 @@ def test_grad_clip_bounds_the_norm():
                           if p.grad is not None))
     assert pre > limit, f"test is vacuous: pre-clip norm {pre:.3f} already below {limit}"
     assert post <= limit * 1.01, f"post-clip norm {post:.3f} > {limit}"
+
+
+def test_alpha_temperature_sharpens_and_stays_consistent():
+    """tau<1 must move alpha further from 0.5 for the same raw value.
+
+    Also asserts forward() and fusion_weights() agree: if they applied different
+    temperatures, the logged alpha would be a different quantity from the one
+    actually used to fuse, and every alpha interpretation would be wrong.
+    """
+    raw = 0.4
+    a_at = {}
+    for tau in (1.0, 0.3):
+        m = HSPPNet(arm="dual", alpha_tau=tau)
+        with torch.no_grad():
+            m.a_raw.fill_(raw)
+        a_at[tau] = m.fusion_weights()[0]
+        # consistency: the property, the vector, and the maths must match
+        assert abs(m.fusion_weight - a_at[tau]) < 1e-6
+        expected = 1.0 / (1.0 + math.exp(-raw / tau))
+        assert abs(a_at[tau] - expected) < 1e-6, f"tau={tau}: {a_at[tau]} != {expected}"
+
+    assert a_at[0.3] > a_at[1.0], "tau<1 should push alpha further from 0.5"
+    assert abs(a_at[0.3] - 0.5) > abs(a_at[1.0] - 0.5)
+
+    # A neutral raw value must still map to exactly 0.5 at any temperature.
+    m = HSPPNet(arm="dual", alpha_tau=0.3)
+    assert abs(m.fusion_weight - 0.5) < 1e-6, "tau must not shift the neutral init"
+
+    with pytest.raises(ValueError):
+        HSPPNet(arm="dual", alpha_tau=0.0)
+
+
+def test_split_is_three_way_and_fully_disjoint():
+    """train/dev/val must be pairwise disjoint by FILENAME and by RECORDING.
+
+    Recording-level disjointness is the load-bearing one: adjacent 3 s segments from
+    the same parent recording are near-duplicates, so a shared recording leaks
+    regardless of filenames differing.
+    """
+    from src.splits import load_labels, load_split, verify_split
+
+    df = load_labels()
+    split = load_split()
+    assert "dev" in split, "run `python -m src.splits` to build the three-way split"
+
+    # verify_split raises on any overlap; call it as the primary assertion.
+    verify_split(df, split)
+
+    group_of = df.set_index("filename")["group"]
+    recs = {k: {group_of[f] for f in split[k]} for k in ("train", "dev", "val")}
+    assert not (recs["train"] & recs["dev"])
+    assert not (recs["train"] & recs["val"])
+    assert not (recs["dev"] & recs["val"])
+    assert sum(len(split[k]) for k in ("train", "dev", "val")) == len(df)
+    # dev must be large enough to fit 42 thresholds on.
+    assert len(split["dev"]) > 5000, f"dev has only {len(split['dev'])} clips"
+
+
+def test_val_fold_matches_completed_runs():
+    """The val fold must not have changed when dev was carved out.
+
+    12 ablation runs were scored on the original val fold. If adding dev perturbed
+    it, those results silently stop being comparable to anything new -- the kind of
+    failure that produces a confident, wrong table.
+    """
+    import json
+    from pathlib import Path
+
+    from src.splits import load_split
+
+    backup = Path("data/splits/split_grouped_2way_backup.json")
+    if not backup.exists():
+        pytest.skip("no pre-dev backup to compare against")
+    old = json.loads(backup.read_text())
+    assert set(old["val"]) == set(load_split()["val"]), (
+        "val fold changed -- completed runs are no longer comparable")

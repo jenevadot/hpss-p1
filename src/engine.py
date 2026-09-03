@@ -139,11 +139,25 @@ def build_scheduler(optimiser, kind, epochs, steps_per_epoch, log=print):
     return sched, "batch"
 
 
-def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
+def train(model, train_ds, val_ds, arm="dual", *, dev_ds=None, epochs=C.MAX_EPOCHS,
           lr=C.LR, weight_decay=C.WEIGHT_DECAY, batch_size=C.BATCH_SIZE,
           num_workers=0, patience=C.EARLY_STOP_PATIENCE, loss_name="bce",
           use_mixup=True, mixup_p=C.MIXUP_P, grad_clip=C.GRAD_CLIP,
+          alpha_lr_mult=C.ALPHA_LR_MULT,
           lr_schedule=C.LR_SCHEDULE, seed=C.SEED, out_dir=None, log=print):
+    """Train one arm.
+
+    Split discipline (the reason dev_ds exists):
+      train  -- gradient updates, and the ONLY source of normalisation statistics
+      dev    -- early stopping, checkpoint selection, per-class threshold fitting
+      val    -- the reported number, evaluated ONCE at the end
+
+    When dev_ds is None the selection set falls back to val, reproducing the
+    pre-dev-split behaviour. That path is retained for comparability with the 12
+    completed ablation runs, but it means val is used for selection AND reporting,
+    so its metrics are optimistically biased. summary.json records which path ran
+    via the "selection_split" field.
+    """
     device = pick_device()
     model = model.to(device)
     out_dir = Path(out_dir or (C.RUNS_DIR / arm))
@@ -163,11 +177,15 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
     # entire job. The fusion weight a_raw is also 1-D and must not be decayed --
     # decay would bias it toward sigmoid(0)=0.5 and confound the very quantity the
     # ablation measures.
-    decay, no_decay = [], []
+    decay, no_decay, alpha = [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim <= 1 or name.endswith(".bias"):
+        if name.endswith("a_raw") and alpha_lr_mult != 1.0:
+            # Own group so the fusion weight can be given a larger step without
+            # touching the rest of the network. Never decayed (see above).
+            alpha.append(param)
+        elif param.ndim <= 1 or name.endswith(".bias"):
             no_decay.append(param)
         else:
             decay.append(param)
@@ -176,12 +194,17 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
     # gets divided by the per-parameter adaptive denominator -- so the effective
     # decay ends up inversely proportional to gradient magnitude. AdamW decouples
     # the two and applies decay directly to the weight.
-    optimiser = torch.optim.AdamW([
+    groups = [
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
-    ], lr=lr)
+    ]
+    if alpha:
+        groups.append({"params": alpha, "weight_decay": 0.0,
+                       "lr": lr * alpha_lr_mult})
+    optimiser = torch.optim.AdamW(groups, lr=lr)
     log(f"weight decay {weight_decay} on {len(decay)} tensors, "
-        f"0.0 on {len(no_decay)} (BN/bias/fusion)")
+        f"0.0 on {len(no_decay)} (BN/bias/fusion)"
+        + (f"; a_raw in its own group at lr x{alpha_lr_mult:g}" if alpha else ""))
 
     # Dedicated generator so shuffle order is reproducible and INDEPENDENT of how
     # many draws SpecAugment takes from the global RNG.
@@ -189,6 +212,14 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
     loader_gen.manual_seed(seed)
     train_loader, val_loader = make_loaders(train_ds, val_ds, batch_size,
                                             num_workers, generator=loader_gen)
+    # The selection loader: dev when available, otherwise val (legacy behaviour).
+    # Every early-stop, checkpoint and threshold decision reads THIS loader only.
+    if dev_ds is not None:
+        _, sel_loader = make_loaders(train_ds, dev_ds, batch_size, num_workers)
+        sel_name = "dev"
+    else:
+        sel_loader = val_loader
+        sel_name = "val"
 
     # MixUp's lambda comes from np.random, so give it its own stream too rather
     # than letting call count depend on unrelated numpy use elsewhere.
@@ -199,8 +230,13 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
     )
 
     log(f"arm={arm}  device={device}  params={sum(p.numel() for p in model.parameters()):,}")
-    log(f"train={len(train_ds):,} clips  val={len(val_ds):,} clips  "
-        f"batch={batch_size}  loss={loss_name}  seed={seed}")
+    log(f"train={len(train_ds):,} clips  "
+        f"dev={len(dev_ds):,} clips  " if dev_ds is not None else
+        f"train={len(train_ds):,} clips  ")
+    log(f"val={len(val_ds):,} clips  batch={batch_size}  loss={loss_name}  seed={seed}")
+    log(f"selection/thresholds on {sel_name.upper()}"
+        + ("  (val read ONCE at the end)" if sel_name == "dev"
+           else "  (LEGACY: val also used for selection -> optimistic)"))
     log(f"mixup={use_mixup} (p={mixup_p}, alpha={C.MIXUP_ALPHA})  "
         f"grad_clip={grad_clip or 'off'}")
 
@@ -262,7 +298,9 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
         current_lr = optimiser.param_groups[0]["lr"]
 
         train_time = time.perf_counter() - t0
-        res, _, _ = evaluate(model, val_loader, device, arm)
+        # Per-epoch evaluation reads the SELECTION split only. val is never touched
+        # inside the loop -- that is the whole point of the dev split.
+        res, _, _ = evaluate(model, sel_loader, device, arm)
         epoch_time = time.perf_counter() - t0
 
         # Plateau needs the metric it is monitoring; cosine already stepped per batch.
@@ -272,8 +310,9 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
         row = {
             "epoch": epoch,
             "train_loss": running / max(n_batches, 1),
-            "val_mAP": res["mAP"],
-            "val_macro_f1": res["macro_f1"],
+            # Named by the split they came from so history.json is unambiguous.
+            f"{sel_name}_mAP": res["mAP"],
+            f"{sel_name}_macro_f1": res["macro_f1"],
             "fusion_a": model.fusion_weight,
             "lr": current_lr,
             # Mean pre-clip gradient norm (sampled every 50th step when clipping is
@@ -287,7 +326,7 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
         }
         history.append(row)
         gn = f" gnorm={row['grad_norm']:.2f}" if row["grad_norm"] is not None else ""
-        log(f"epoch {epoch:3d}  loss {row['train_loss']:.4f}  val_mAP {res['mAP']:.4f}  "
+        log(f"epoch {epoch:3d}  loss {row['train_loss']:.4f}  {sel_name}_mAP {res['mAP']:.4f}  "
             f"macro_f1 {res['macro_f1']:.4f}  a={row['fusion_a']:.3f}  "
             f"lr={current_lr:.2e}{gn}  {epoch_time:.0f}s")
 
@@ -295,27 +334,46 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
             best = {"mAP": res["mAP"], "epoch": epoch}
             stale = 0
             torch.save({"model": model.state_dict(), "arm": arm, "epoch": epoch,
-                        "val_mAP": res["mAP"]}, out_dir / "best.pt")
+                        f"{sel_name}_mAP": res["mAP"]}, out_dir / "best.pt")
         else:
             stale += 1
             if stale >= patience:
-                log(f"early stop at epoch {epoch} (best mAP {best['mAP']:.4f} @ {best['epoch']})")
+                log(f"early stop at epoch {epoch} "
+                    f"(best {sel_name} mAP {best['mAP']:.4f} @ {best['epoch']})")
                 break
 
         (out_dir / "history.json").write_text(json.dumps(history, indent=2))
 
-    # Reload best weights, then fit per-class thresholds on val.
+    # ---------------------------------------------------------------- final scoring
+    # Reload the checkpoint selected on the SELECTION split.
     ckpt = torch.load(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
-    res, y_true, y_score = evaluate(model, val_loader, device, arm)
-    thresholds, fell_back = tune_thresholds(y_true, y_score)
-    tuned, _, _ = evaluate(model, val_loader, device, arm, thresholds)
 
-    log(f"\nbest epoch {ckpt['epoch']}  val mAP {res['mAP']:.4f}")
-    log(f"after per-class threshold tuning: macro_f1 {res['macro_f1']:.4f} "
-        f"-> {tuned['macro_f1']:.4f}")
+    # Thresholds are fitted on the SELECTION split. Fitting them on val and then
+    # reporting val would be circular: per-class F1-argmax is 42 fitted parameters,
+    # and scoring them on the same data they were fitted to inflates macro-F1. In
+    # the legacy runs that inflation was measured at 0.4568 -> 0.6426, so a large
+    # part of that gain was fitted-on-what-it-scores rather than real.
+    sel_res, sel_true, sel_score = evaluate(model, sel_loader, device, arm)
+    thresholds, fell_back = tune_thresholds(sel_true, sel_score)
+    sel_tuned, _, _ = evaluate(model, sel_loader, device, arm, thresholds)
+
+    log(f"\nbest epoch {ckpt['epoch']}  {sel_name} mAP {sel_res['mAP']:.4f}")
+    log(f"{sel_name} macro_f1 @0.5 {sel_res['macro_f1']:.4f} "
+        f"-> tuned {sel_tuned['macro_f1']:.4f}")
     if fell_back:
-        log(f"thresholds left at 0.5 (<5 val positives): {fell_back}")
+        log(f"thresholds left at 0.5 (<5 {sel_name} positives): {fell_back}")
+
+    # val, evaluated ONCE, with the thresholds frozen from the selection split.
+    # These are the only numbers that may be reported as an unbiased estimate.
+    res, _, _ = evaluate(model, val_loader, device, arm)
+    tuned, _, _ = evaluate(model, val_loader, device, arm, thresholds)
+    if sel_name == "dev":
+        log(f"\nVAL (held out, read once, dev-fitted thresholds): "
+            f"mAP {res['mAP']:.4f}  macro_f1 {tuned['macro_f1']:.4f}  "
+            f"micro_f1 {tuned['micro_f1']:.4f}")
+        log(f"  dev->val mAP generalisation gap: "
+            f"{res['mAP'] - sel_res['mAP']:+.4f}")
 
     np.save(out_dir / "thresholds.npy", thresholds)
 
@@ -337,6 +395,14 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
         "val_macro_f1_tuned": tuned["macro_f1"],
         "val_micro_f1_tuned": tuned["micro_f1"],
         "tail_mAP": res["tail_mAP"],
+        # Which split drove selection and threshold fitting. "val" means the legacy
+        # path ran and the val metrics above are optimistically biased.
+        "selection_split": sel_name,
+        # Selection-split metrics, kept so tuning can be compared WITHOUT reading
+        # val. All hyperparameter decisions should use dev_mAP, not val_mAP.
+        "dev_mAP": sel_res["mAP"] if sel_name == "dev" else None,
+        "dev_macro_f1_tuned": sel_tuned["macro_f1"] if sel_name == "dev" else None,
+        "dev_to_val_gap": (res["mAP"] - sel_res["mAP"]) if sel_name == "dev" else None,
         "fusion_a": model.fusion_weight,
         "fusion_a_per_class": fusion_per_class,
         "stem_pool": C.STEM_POOL,
@@ -346,6 +412,8 @@ def train(model, train_ds, val_ds, arm="dual", *, epochs=C.MAX_EPOCHS,
         "epochs_run": len(history),
         "seed": seed,
         "mixup_p": mixup_p if use_mixup else 0.0,
+        "alpha_tau": getattr(model, "alpha_tau", None),
+        "alpha_lr_mult": alpha_lr_mult,
         "grad_clip": grad_clip,
         "per_class_ap": res["per_class_ap"],
         "threshold_fallbacks": fell_back,

@@ -149,6 +149,28 @@ STEM_POOL = 2
 # Set False to recover the paper's exact scalar formulation for comparison.
 PER_CLASS_FUSION = True
 
+# Fusion sigmoid temperature and a dedicated lr multiplier for a_raw.
+#
+# MEASURED problem: 19-20 of 34 per-class alphas end training within 0.05 of their
+# 0.5 initialisation (seed 42: 19/34, seed 43: 11/34, seed 44: 20/34), with a
+# cross-class std of only ~0.083. The weights are reproducible across seeds
+# (pairwise r = 0.94), so the model IS learning a real preference -- it simply
+# cannot travel far enough in 40 epochs.
+#
+# This is a gradient-magnitude fact, not a per-class-performance fact: a_raw
+# receives gradient scaled by sigmoid'(0) = 0.25 and is a single scalar per class
+# competing against 15.8M other parameters at one shared lr.
+#
+# Two independent, purely-optimisation remedies:
+#   ALPHA_TAU     -- sigmoid(a_raw / tau). tau<1 sharpens the map, so the same raw
+#                    displacement produces a larger change in alpha.
+#   ALPHA_LR_MULT -- put a_raw in its own param group at lr * this.
+# Neither tells the model WHICH stream to prefer; both only make the destination
+# reachable. Defaults are the identity so the pre-registered dev sweep measures
+# their effect rather than assuming it.
+ALPHA_TAU = 1.0
+ALPHA_LR_MULT = 1.0
+
 # ---------------------------------------------------------------- labels
 # Column order in train.csv. Keep all 42 so label indices stay in sync with the CSV.
 SPECIES = [
@@ -177,6 +199,21 @@ MULTI_SITE_SPECIES = ["BOAFAB", "DENMIN", "LEPLAT", "PHYCUV", "PITAZU"]
 # ---------------------------------------------------------------- splits
 VAL_FRACTION = 0.15
 N_SPLIT_FOLDS = 7  # StratifiedGroupKFold: 1 fold val (~1/7 ~= 14%), rest train
+
+# Second, nested grouped split carving DEV out of the train groups only.
+#
+# Why a dev split exists: val was doing three incompatible jobs simultaneously --
+# early stopping, per-class threshold fitting (42 fitted parameters), and
+# architecture/hyperparameter selection. Each use spends some of val's credibility
+# as an unbiased estimate, and there is NO labelled test set to catch the damage
+# (test.7z holds 31,187 wavs and ships no CSV).
+#
+# 6 folds -> dev is ~1/6 of the train groups (~15% of the corpus), leaving train at
+# ~70%. The val fold itself is UNCHANGED, so the 12 completed ablation runs remain
+# comparable to anything produced later.
+#
+# Discipline: tune and fit thresholds on DEV. Read VAL as few times as possible.
+N_DEV_FOLDS = 6
 
 
 def group_key(filename: str) -> str:

@@ -73,6 +73,10 @@ def main():
                     help="fraction of batches to mix (1.0 = the old always-on behaviour)")
     ap.add_argument("--grad-clip", type=float, default=C.GRAD_CLIP,
                     help="max gradient norm; 0 disables")
+    ap.add_argument("--alpha-tau", type=float, default=C.ALPHA_TAU,
+                    help="fusion sigmoid temperature; <1 sharpens toward 0/1")
+    ap.add_argument("--alpha-lr-mult", type=float, default=C.ALPHA_LR_MULT,
+                    help="lr multiplier for the fusion weight only")
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -80,21 +84,27 @@ def main():
     C.STEM_POOL = args.stem_pool
 
     print(f"building datasets for arm={args.arm} ...")
-    train_ds, val_ds, norm = build_datasets(arm=args.arm)
+    train_ds, dev_ds, val_ds, norm = build_datasets(arm=args.arm)
     print(f"norm (train-split only): mean={norm[0]:.3f} std={norm[1]:.3f}")
+    if dev_ds is None:
+        print("WARNING: split file has no 'dev' key -- falling back to selecting on "
+              "val, which makes val metrics optimistically biased. "
+              "Run `python -m src.splits` to create the three-way split.")
 
-    model = HSPPNet(arm=args.arm, per_class_fusion=not args.scalar_fusion)
+    model = HSPPNet(arm=args.arm, per_class_fusion=not args.scalar_fusion,
+                    alpha_tau=args.alpha_tau)
     fusion = "scalar" if args.scalar_fusion else "per-class"
     print(f"model params: {count_parameters(model):,}  "
-          f"stem_pool={args.stem_pool}  fusion={fusion}")
+          f"stem_pool={args.stem_pool}  fusion={fusion}  alpha_tau={args.alpha_tau}")
 
     out_dir = C.RUNS_DIR / (args.tag or f"{args.arm}_seed{args.seed}")
     train(
-        model, train_ds, val_ds, arm=args.arm,
+        model, train_ds, val_ds, arm=args.arm, dev_ds=dev_ds,
         epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
         num_workers=args.num_workers, patience=args.patience,
         loss_name=args.loss, use_mixup=not args.no_mixup,
         mixup_p=args.mixup_p, grad_clip=args.grad_clip,
+        alpha_lr_mult=args.alpha_lr_mult,
         lr_schedule=args.lr_schedule, seed=args.seed, out_dir=out_dir,
     )
     print(f"\nartifacts in {out_dir}")

@@ -154,7 +154,14 @@ def compute_norm_stats(filenames, arm="dual", h5_path=None, sample=4000):
 
 
 def build_datasets(arm="dual", h5_path=None):
-    """Returns (train_ds, val_ds, norm) using the saved grouped split."""
+    """Returns (train_ds, dev_ds, val_ds, norm) using the saved grouped split.
+
+    dev_ds is None when the split file has no 'dev' key (the original two-way
+    split), in which case callers fall back to using val for early stopping and
+    threshold fitting -- the pre-dev-split behaviour.
+
+    Normalisation is computed on the TRAIN split only, never dev or val.
+    """
     from .splits import load_labels, load_split
 
     df = load_labels().set_index("filename")
@@ -166,8 +173,9 @@ def build_datasets(arm="dual", h5_path=None):
         names = [n.decode() for n in h5["filenames"][:]]
         ready = {n for n, d in zip(names, done) if d}
 
+    wanted = [n for n in ("train", "dev", "val") if n in split]
     out = {}
-    for name in ("train", "val"):
+    for name in wanted:
         keep = [f for f in split[name] if f in available and f in ready]
         dropped = len(split[name]) - len(keep)
         if dropped:
@@ -175,6 +183,10 @@ def build_datasets(arm="dual", h5_path=None):
         out[name] = (keep, df.loc[keep, C.SPECIES].to_numpy())
 
     norm = compute_norm_stats(out["train"][0], arm=arm, h5_path=h5_path)
-    train_ds = AnuraFeatures(*out["train"], arm=arm, train=True, h5_path=h5_path, norm=norm)
-    val_ds = AnuraFeatures(*out["val"], arm=arm, train=False, h5_path=h5_path, norm=norm)
-    return train_ds, val_ds, norm
+    mk = lambda key, train: AnuraFeatures(  # noqa: E731
+        *out[key], arm=arm, train=train, h5_path=h5_path, norm=norm)
+
+    train_ds = mk("train", True)
+    dev_ds = mk("dev", False) if "dev" in out else None
+    val_ds = mk("val", False)
+    return train_ds, dev_ds, val_ds, norm
