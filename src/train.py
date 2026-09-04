@@ -80,6 +80,8 @@ def main():
     ap.add_argument("--width", type=float, default=1.0,
                     help="channel multiplier; 1.41 makes a single stream match "
                          "dual's parameter count (capacity control)")
+    ap.add_argument("--h5", default=None,
+                    help="features file; use per-kernel files for the HPSS sweep")
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -87,8 +89,17 @@ def main():
     C.STEM_POOL = args.stem_pool
 
     print(f"building datasets for arm={args.arm} ...")
-    train_ds, dev_ds, val_ds, norm = build_datasets(arm=args.arm)
+    train_ds, dev_ds, val_ds, norm = build_datasets(arm=args.arm, h5_path=args.h5)
     print(f"norm (train-split only): mean={norm[0]:.3f} std={norm[1]:.3f}")
+
+    # Report the separation the features were actually built with. Training on a
+    # per-kernel file while believing it is the default is the failure mode the
+    # HPSS sweep is most exposed to, so surface it rather than trusting the filename.
+    import h5py
+    with h5py.File(str(args.h5 or C.FEATURES_H5), "r") as h5:
+        feat_kernel = h5.attrs.get("hpss_kernel", "unstamped (pre-sweep file)")
+    print(f"features: {args.h5 or C.FEATURES_H5}  hpss_kernel={feat_kernel}")
+
     if dev_ds is None:
         print("WARNING: split file has no 'dev' key -- falling back to selecting on "
               "val, which makes val metrics optimistically biased. "
@@ -110,6 +121,7 @@ def main():
         mixup_p=args.mixup_p, grad_clip=args.grad_clip,
         alpha_lr_mult=args.alpha_lr_mult,
         lr_schedule=args.lr_schedule, seed=args.seed, out_dir=out_dir,
+        hpss_kernel=feat_kernel,
     )
     print(f"\nartifacts in {out_dir}")
 

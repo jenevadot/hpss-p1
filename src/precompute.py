@@ -30,18 +30,28 @@ N_WORKERS = 10  # leave 4 of 14 cores for the OS and the writer process
 
 
 def _one(task):
-    """Worker: returns (index, X_h, X_p, X_raw) as fp16, or (index, None...) on error."""
-    idx, path = task
+    """Worker: returns (index, X_h, X_p, X_raw) as fp16, or (index, None...) on error.
+
+    `kernel` travels INSIDE the task tuple, not via a mutated config module. Workers
+    are spawned (macOS has no fork), so each re-imports src.config fresh and would
+    silently use the default HPSS_KERNEL if we set it only in the parent -- producing
+    a features file whose name says one kernel and whose contents used another.
+    """
+    idx, path, kernel = task
     try:
         y = load_audio(path)
-        x_h, x_p = hpss_mel(y)
+        x_h, x_p = hpss_mel(y, kernel_size=kernel)
         x_r = raw_mel(y)
         return idx, x_h.astype(np.float16), x_p.astype(np.float16), x_r.astype(np.float16)
     except Exception as exc:  # noqa: BLE001 - record and continue; reported at the end
         return idx, None, None, str(exc)
 
 
-def build(csv_path, audio_dir, out_path, limit=None):
+def build(csv_path, audio_dir, out_path, limit=None, kernel=None):
+    kernel = int(kernel or C.HPSS_KERNEL)
+    if kernel % 2 == 0:
+        raise ValueError(f"HPSS kernel must be odd (a median needs a middle "
+                         f"element), got {kernel}")
     df = pd.read_csv(csv_path)
     names = df["filename"].tolist()
     if limit:
@@ -62,10 +72,16 @@ def build(csv_path, audio_dir, out_path, limit=None):
             h5.create_dataset("filenames", data=np.array(names, dtype="S64"))
 
         done = h5["done"][:]
-        todo = [(i, audio_dir / names[i]) for i in range(n) if not done[i]]
-        print(f"{n:,} clips total, {len(todo):,} to compute, {int(done.sum()):,} already done")
+        todo = [(i, audio_dir / names[i], kernel) for i in range(n) if not done[i]]
+        print(f"{n:,} clips total, {len(todo):,} to compute, "
+              f"{int(done.sum()):,} already done  (HPSS kernel={kernel})")
         if not todo:
             return
+
+        # Stamp the kernel into the file so a features file can never be silently
+        # mistaken for one built with a different separation.
+        h5.attrs["hpss_kernel"] = kernel
+        h5.attrs["hpss_margin"] = C.HPSS_MARGIN
 
         errors = []
         with mp.get_context("spawn").Pool(N_WORKERS) as pool:
@@ -92,7 +108,11 @@ if __name__ == "__main__":
     ap.add_argument("--audio-dir", default=str(C.AUDIO_TRAIN))
     ap.add_argument("--out", default=str(C.FEATURES_H5))
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--kernel", type=int, default=None,
+                    help="HPSS median filter size (odd). Default config.HPSS_KERNEL. "
+                         "Use a distinct --out per kernel value.")
     args = ap.parse_args()
 
     from pathlib import Path
-    build(Path(args.csv), Path(args.audio_dir), Path(args.out), args.limit)
+    build(Path(args.csv), Path(args.audio_dir), Path(args.out), args.limit,
+          kernel=args.kernel)

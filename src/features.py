@@ -51,14 +51,34 @@ def load_audio(path) -> np.ndarray:
     return y
 
 
-def hpss_mel(y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def hpss_mel(y: np.ndarray, kernel_size: int | None = None
+             ) -> tuple[np.ndarray, np.ndarray]:
     """Return (harmonic, percussive) log-mel spectrograms, each (N_MELS, N_FRAMES).
 
     Order: STFT -> HPSS on the complex linear spectrogram -> power -> mel -> dB.
+
+    `kernel_size` overrides config.HPSS_KERNEL. It is an explicit parameter rather
+    than a config read because precompute workers are SPAWNED: each re-imports
+    src.config fresh, so mutating the parent's C.HPSS_KERNEL would not reach them and
+    would silently produce features built with the default kernel.
+
+    Physical units matter when choosing it. At hop=512 / 22,050 Hz each frame is
+    23.2 ms and each mel-adjacent STFT bin is 21.5 Hz, so kernel k spans
+    k x 23.2 ms in time and k x 21.5 Hz in frequency:
+
+        k=5  116 ms / 108 Hz     k=17  394 ms / 366 Hz   <- config default
+        k=9  209 ms / 194 Hz     k=25  580 ms / 538 Hz
+        k=13 302 ms / 280 Hz
+
+    Anuran calls here are 200-500 ms events, so the default 17 asks "does energy
+    persist across 394 ms?" -- longer than many of the calls it must detect. A
+    tonal 250 ms call fails that test and is routed to the PERCUSSIVE stream
+    regardless of its actual structure. 17 was inherited from the paper's sweep on
+    10 s DCASE scene clips and has never been validated in this domain.
     """
     S = librosa.stft(y, n_fft=C.N_FFT, hop_length=C.HOP_LENGTH)
     S_h, S_p = librosa.decompose.hpss(
-        S, kernel_size=C.HPSS_KERNEL, margin=C.HPSS_MARGIN,
+        S, kernel_size=int(kernel_size or C.HPSS_KERNEL), margin=C.HPSS_MARGIN,
     )
     fb = mel_filterbank()
     out = []
