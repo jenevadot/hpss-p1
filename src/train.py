@@ -77,6 +77,9 @@ def main():
                     help="fusion sigmoid temperature; <1 sharpens toward 0/1")
     ap.add_argument("--alpha-lr-mult", type=float, default=C.ALPHA_LR_MULT,
                     help="lr multiplier for the fusion weight only")
+    ap.add_argument("--width", type=float, default=1.0,
+                    help="channel multiplier; 1.41 makes a single stream match "
+                         "dual's parameter count (capacity control)")
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -92,10 +95,11 @@ def main():
               "Run `python -m src.splits` to create the three-way split.")
 
     model = HSPPNet(arm=args.arm, per_class_fusion=not args.scalar_fusion,
-                    alpha_tau=args.alpha_tau)
+                    alpha_tau=args.alpha_tau, width=args.width)
     fusion = "scalar" if args.scalar_fusion else "per-class"
     print(f"model params: {count_parameters(model):,}  "
-          f"stem_pool={args.stem_pool}  fusion={fusion}  alpha_tau={args.alpha_tau}")
+          f"stem_pool={args.stem_pool}  fusion={fusion}  "
+          f"alpha_tau={args.alpha_tau}  width={args.width}")
 
     out_dir = C.RUNS_DIR / (args.tag or f"{args.arm}_seed{args.seed}")
     train(

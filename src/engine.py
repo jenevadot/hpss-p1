@@ -414,6 +414,8 @@ def train(model, train_ds, val_ds, arm="dual", *, dev_ds=None, epochs=C.MAX_EPOC
         "mixup_p": mixup_p if use_mixup else 0.0,
         "alpha_tau": getattr(model, "alpha_tau", None),
         "alpha_lr_mult": alpha_lr_mult,
+        "width": getattr(model, "width", 1.0),
+        "n_params": sum(p.numel() for p in model.parameters()),
         "grad_clip": grad_clip,
         "per_class_ap": res["per_class_ap"],
         "threshold_fallbacks": fell_back,

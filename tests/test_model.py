@@ -319,6 +319,31 @@ def test_alpha_temperature_sharpens_and_stays_consistent():
         HSPPNet(arm="dual", alpha_tau=0.0)
 
 
+def test_width_scales_capacity_and_matches_dual():
+    """width=1.41 must bring a single stream within ~1% of dual's parameter count.
+
+    This is the capacity control: dual has 2x a single stream's parameters, so
+    "dual wins because HPSS decomposition helps" is confounded with "dual wins
+    because it is bigger" until a single-stream model is given matching capacity.
+    If this drifts, the control stops controlling and the comparison is void.
+    """
+    dual = count_parameters(HSPPNet(arm="dual"))
+    narrow = count_parameters(HSPPNet(arm="raw", width=1.0))
+    wide = count_parameters(HSPPNet(arm="raw", width=1.41))
+
+    assert narrow < dual, "single stream should be smaller at width=1.0"
+    assert abs(wide - dual) / dual < 0.01, (
+        f"width=1.41 gives {wide:,} vs dual {dual:,} "
+        f"({abs(wide - dual) / dual * 100:.2f}% off, want <1%)")
+
+    # Width must propagate to the attention and head dims, not just the streams,
+    # or the model would fail to build at all.
+    m = HSPPNet(arm="dual", width=1.41)
+    out = m(torch.randn(2, 1, C.N_MELS, C.N_FRAMES),
+            torch.randn(2, 1, C.N_MELS, C.N_FRAMES))
+    assert out.shape == (2, C.N_CLASSES)
+
+
 def test_split_is_three_way_and_fully_disjoint():
     """train/dev/val must be pairwise disjoint by FILENAME and by RECORDING.
 

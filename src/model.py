@@ -139,7 +139,7 @@ class HSPPNet(nn.Module):
 
     def __init__(self, n_classes: int = C.N_CLASSES, arm: str = "dual",
                  dropout: float = 0.5, per_class_fusion: bool | None = None,
-                 alpha_tau: float | None = None):
+                 alpha_tau: float | None = None, width: float = 1.0):
         super().__init__()
         if arm not in self.ARMS:
             raise ValueError(f"arm must be one of {self.ARMS}, got {arm!r}")
@@ -152,21 +152,30 @@ class HSPPNet(nn.Module):
         if alpha_tau <= 0:
             raise ValueError(f"alpha_tau must be > 0, got {alpha_tau}")
         self.alpha_tau = float(alpha_tau)
+        self.width = float(width)
         self.arm = arm
         self.dual = arm == "dual"
         self.n_classes = n_classes
         self.per_class_fusion = per_class_fusion and self.dual
 
+        # Channel schedule, scaled by `width`. width=1.0 is the paper's
+        # 64->128->256->512. Used by the capacity control (§ raw-wide): the dual arm
+        # has 2x the parameters of a single stream, so "is dual better because of the
+        # HPSS decomposition, or just because it is bigger?" is confounded until a
+        # single-stream model is given matching capacity.
+        channels = tuple(int(round(c * self.width)) for c in (64, 128, 256, 512))
+        c_last = channels[-1]
+
         # Identical structure, independent parameters -- the paper is explicit that
         # weights are NOT shared between the harmonic and percussive streams.
-        self.stream_h = Stream()
+        self.stream_h = Stream(channels=channels)
         self.spatial_h = SpatialAttention()
-        self.channel_h = ChannelAttention(512)
+        self.channel_h = ChannelAttention(c_last)
 
         if self.dual:
-            self.stream_p = Stream()
+            self.stream_p = Stream(channels=channels)
             self.spatial_p = SpatialAttention()
-            self.channel_p = ChannelAttention(512)
+            self.channel_p = ChannelAttention(c_last)
             # Learnable fusion weight a in [0,1], stored raw and squashed with
             # sigmoid. Init 0 -> a=0.5 (unbiased). Never clamp: clamping gives zero
             # gradient at the boundary and the parameter dies.
@@ -178,7 +187,7 @@ class HSPPNet(nn.Module):
             self.a_raw = nn.Parameter(torch.zeros(n_a))
 
         self.head = nn.Sequential(
-            nn.Linear(512, 256), nn.ReLU(inplace=True), nn.Dropout(dropout),
+            nn.Linear(c_last, 256), nn.ReLU(inplace=True), nn.Dropout(dropout),
             nn.Linear(256, n_classes),
         )
 
