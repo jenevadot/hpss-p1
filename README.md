@@ -1,16 +1,16 @@
-# HSPP replication on AnuraSet
+# Réplica de HSPP en AnuraSet
 
-Replication of the dual-stream HPSS + asymmetric-convolution CNN from
+Réplica de la CNN de doble flujo HPSS + convoluciones asimétricas de
 *"Structure-aware acoustic scene classification: a feature decoupling framework
-using HPSS and asymmetric convolutions"* (Liu & Fan, Sci Reports 2026), adapted
-from single-label acoustic scene classification to **multi-label anuran species
-detection** on AnuraSet.
+using HPSS and asymmetric convolutions"* (Liu & Fan, Sci Reports 2026), adaptada
+de clasificación de escenas acústicas de etiqueta única a **detección multietiqueta
+de especies de anuros** en AnuraSet.
 
-Note the paper does not propose an AST/Transformer method. It proposes a
-lightweight CNN and positions it *against* AST (12.4M vs 86M params, 24.1 ms vs
-68.3 ms inference, 72.1% vs 73.1% accuracy). AST is one of its baselines.
+Nótese que el paper no propone un método AST/Transformer. Propone una CNN
+liviana y la posiciona *frente a* AST (12.4M vs 86M params, 24.1 ms vs
+68.3 ms de inferencia, 72.1% vs 73.1% de exactitud). AST es uno de sus baselines.
 
-## Setup
+## Instalación
 
 ```bash
 uv venv --python ~/.local/bin/python3.11 .venv
@@ -19,154 +19,203 @@ VIRTUAL_ENV=.venv uv pip install "torch>=2.2" torchaudio "librosa>=0.10" soundfi
     fastapi uvicorn python-multipart pytest
 
 tar -xf train.7z -C data/          # 62,191 clips, 7.7 GB
-tar -xf test.7z  -C data/          # ~31,260 clips
+tar -xf test.7z  -C data/          # 31,187 clips (las etiquetas vienen del origen, más abajo)
 ```
 
-Python 3.11 is pinned deliberately: 3.14 has no reliable torch wheels, and
-librosa needs numba, which lags new CPython releases.
+Python 3.11 está fijado deliberadamente: 3.14 no tiene wheels confiables de torch,
+y librosa necesita numba, que se retrasa respecto a las versiones nuevas de CPython.
 
 ## Pipeline
 
 ```bash
-.venv/bin/python -m src.splits                    # grouped split + leakage asserts
-.venv/bin/python -m src.precompute                # -> data/features.h5 (5.2 GB, ~16 min)
-.venv/bin/python -m pytest tests/ -q -s           # 8 verification tests
+.venv/bin/python -m src.splits                    # split agrupado en 3 vías + asserts de fuga
+.venv/bin/python -m src.precompute                # -> data/features.h5 (5.8 GB, ~16 min)
+.venv/bin/python -m pytest tests/ -q               # 19 tests de verificación (~4.5 min)
 PYTORCH_ENABLE_MPS_FALLBACK=1 caffeinate -i \
-  .venv/bin/python -u -m src.train --arm dual     # one ablation arm
-.venv/bin/python -m src.analyze                   # ablation table
+  .venv/bin/python -u -m src.train --arm dual     # un brazo de la ablación
+./run_final_ablation.sh                           # la ablación reportable de 4 brazos x 3 semillas
+.venv/bin/python -m src.analyze                   # tabla de ablación
+.venv/bin/python -m src.analyze --tuning          # barrido de tuning, ordenado por dev
 .venv/bin/python -m src.analyze --complexity      # params / FLOPs
 PYTORCH_ENABLE_MPS_FALLBACK=1 .venv/bin/uvicorn src.serve:app --port 8000
 ```
 
-## Measured on this machine (M4 Pro, 24 GB, MPS)
+El paquete `test.7z` contiene 31,187 wavs **sin CSV de etiquetas**, por lo que durante
+los experimentos `val` fue la única estimación retenida. Las etiquetas se localizaron
+después en el origen, en `AnuraSet_v1.0.0/metadata.csv` (columna `subset`; train=62,191 /
+test=31,187, coincidencia exacta con el split local) y el conjunto de test se evaluó
+**una sola vez** al final con umbrales ajustados en dev. Ver `RESULTS_REPORT.md` §7.
 
-| | value |
+## Configuración actual (adoptada)
+
+La configuración con la que corre la ablación reportable. La única fuente de verdad es
+`src/config.py`; esta tabla registra *qué evidencia respalda cada valor*. Detalle completo en
+`TUNING.md`, estado actual en `HANDOFF.md`.
+
+| Parámetro | Valor | Evidencia |
+|---|---|---|
+| `MIXUP_P` | **0.7** | **Adoptado.** +0.0174 en 3 semillas vs 0.5, gana 3/3, sd 0.0027 vs 0.0172 (reducción de varianza de 6×). La única mejora de tuning confirmada del proyecto |
+| `MIXUP_ALPHA` | 0.2 | Beta(0.2,0.2), con forma de U — mezclas mayormente casi limpias |
+| `STEM_POOL` | 2 | 4.02× menos FLOPs (11.216 → 2.792 G), 0 params extra. `stem_pool=1` parecía dar +0.018 pero fue un artefacto de una sola época que costaba 3.8× de cómputo |
+| `PER_CLASS_FUSION` | True | **Corrección de exactitud, no una ganancia.** Con α escalar, dual puntuaba *por debajo* de solo-percusivo (0.6541 < 0.6886). α por clase (+41 params) elimina eso; cuesta −0.0035 mAP, dentro del ruido. Reproducible entre semillas (r=0.939) |
+| `ALPHA_TAU` | 1.0 | `tau=0.3` rechazado: 2/3 semillas, p=0.750, perdió la semilla 43 por −0.0177 |
+| `ALPHA_LR_MULT` | 1.0 | `10` rechazado — perjudicó de forma medible (0.7012 vs 0.7151) |
+| `LR_SCHEDULE` | cosine + warmup de 2 épocas | Eliminó una lotería de ±0.035 en la mejor época. `attr_flatlr` −0.0018 ⇒ **sin ganancia medible en mAP**; se mantiene por estabilidad |
+| optimizador | AdamW, lr 1e-3, grupos sin decay | **Nunca ablacionado.** Es exactitud (γ/β de BN y `a_raw` no deberían recibir decay), no una mejora medida |
+| pérdida | BCEWithLogits | ASL declarada por adelantado, puntuó −0.0098. Rechazada |
+| `GRAD_CLIP` | 0.0 | Norma pre-clip medida en 0.132 — un umbral de 1.0 nunca se activaba y costaba ~16%/paso |
+| `BATCH_SIZE` | 64 | El paper usó 32, que subutiliza MPS. 192 gana 11% más pero cambia el LR efectivo — rechazado para preservar la comparabilidad |
+| épocas / paciencia | 40 / 20 | `ep60` ganó ±0.000 |
+| `HPSS_KERNEL` | 17 (394 ms) | Barrido {5,9,13,25} = 116–580 ms. **Resultado nulo**: dispersión 0.0150 < σ 0.0172, sin tendencia |
+| `HPSS_MARGIN` | 1.0 | Preserva `X_h + X_p = X_raw` con error de 1.5e-05 — es decir, HPSS aporta **cero** información |
+| `SPEC_TIME_MASK` | 12 | El 40 del paper se ajustó sobre clips de 431 frames; los nuestros tienen 130. Transferido como duración, no como entero |
+| `SPEC_FREQ_MASK` / máscaras | 8 / 2 | |
+| split | tres vías, agrupado por grabación | dev selecciona; val se lee **una vez**; test se evalúa una vez al final con umbrales ajustados en dev |
+| params | 15,824,344 dual / 7,983,212 single | 15,777,394 para el control de capacidad de ancho 1.41 |
+
+**La arquitectura es la del paper, intacta** — tipos de capa, orden de bloques, anchos
+de canales y los pares de convoluciones asimétricas 1×n / n×1 son todos los publicados. Cada
+cambio de arriba es de optimizador, aumentación o del lado de la entrada, que es lo que mantiene
+esto como una réplica de la ablación del paper y no como un modelo distinto.
+
+**Léase esto con honestidad:** de los cuatro cambios que en su momento se acreditaron con +0.109
+sobre la configuración antigua, tres miden cero o negativo individualmente y el cuarto (AdamW)
+nunca se ablacionó. MixUp 0.7 es la única mejora confirmada. El resto es ingeniería
+defendible, no ganancia demostrada.
+
+## Medido en esta máquina (M4 Pro, 24 GB, MPS)
+
+| | valor |
 |---|---|
-| HPSS feature extraction | 29.8 ms/clip → ~16 min for 62,191 clips on 10 procs |
-| features.h5 | 5.2 GB (3 streams: X_h, X_p, X_raw), fp16 |
-| dual arm throughput | 66 samples/s → **13.5 min/epoch** |
-| single-stream arms | ~132 samples/s → **6.8 min/epoch** |
-| DataLoader (num_workers=0) | 2,500 samples/s — 38× faster than the model, so not the bottleneck |
-| params (dual / single) | 15,824,303 / 7,983,212 |
+| extracción de features HPSS | 29.8 ms/clip → ~16 min para 62,191 clips en 10 procesos |
+| features.h5 | 5.8 GB (3 flujos: X_h, X_p, X_raw), fp16 |
+| brazo dual | **~190 s/época** (`STEM_POOL=2`) |
+| brazos de flujo único | **~92 s/época** |
+| raw-wide (`--width 1.41`) | ~255 s/época |
+| proporción de la época dedicada a eval | 11.5 s de 185 s = **6.2%** — optimizar eval no tiene sentido |
+| autocast bf16 | funciona en MPS, no gana **nada**: dual 1.02×, raw 0.97× (más lento) |
+| DataLoader (num_workers=0) | 2,500 muestras/s — 38× más rápido que el modelo, así que no es el cuello de botella |
+| params (dual / single) | 15,824,344 / 7,983,212 |
+| σ entre semillas (split de tres vías) | **0.0172** — no el 0.0078 de la escalera de dos vías |
 
-`num_workers=0` is the measured-best setting: features are precomputed, so each
-sample is a small HDF5 read and worker spawn overhead is pure cost.
+`num_workers=0` es el valor medido como mejor: los features están precomputados, así que cada
+muestra es una lectura HDF5 pequeña y el overhead de crear workers es costo puro.
 
-## Deviations from the paper, and why
+## Desviaciones respecto al paper, y por qué
 
-| # | Paper | Here | Reason |
+| # | Paper | Aquí | Razón |
 |---|---|---|---|
-| 1 | Softmax + cross-entropy, 10 classes | Sigmoid + BCE, 42 logits | Task is multi-label: 0–8 species per clip |
-| 2 | Accuracy | mAP / macro-F1 over 34 classes | 36% of clips are all-negative, so accuracy is meaningless |
-| 3 | SpecAugment time mask 40 | **12** | 40 frames is 31% of a 130-frame clip; 2 masks would erase 60% of a call |
-| 4 | Batch size 32 | 64 | 32 underutilises MPS; throughput is flat 32→64 so 64 costs nothing |
-| 5 | `Softmax` output | raw logits | `BCEWithLogitsLoss` applies the sigmoid internally and stably |
+| 1 | Softmax + entropía cruzada, 10 clases | Sigmoide + BCE, 42 logits | La tarea es multietiqueta: 0–8 especies por clip |
+| 2 | Exactitud | mAP / macro-F1 sobre 34 clases | 36% de los clips son todo-negativos, así que la exactitud no significa nada |
+| 3 | Máscara temporal de SpecAugment 40 | **12** | 40 frames es el 31% de un clip de 130 frames; 2 máscaras borrarían el 60% de un canto |
+| 4 | Tamaño de lote 32 | 64 | 32 subutiliza MPS; el throughput es plano de 32→64, así que 64 no cuesta nada |
+| 5 | Salida `Softmax` | logits crudos | `BCEWithLogitsLoss` aplica la sigmoide internamente y de forma estable |
 
-## Two internal inconsistencies found in the paper
+## Dos inconsistencias internas encontradas en el paper
 
-**1. Parameter count.** The paper reports 12.4M. Its stated channel progression
-(`64→64→128→256→512` — five numbers for four blocks) is ambiguous and no reading
-reproduces 12.4M:
+**1. Conteo de parámetros.** El paper reporta 12.4M. Su progresión de canales declarada
+(`64→64→128→256→512` — cinco números para cuatro bloques) es ambigua y ninguna lectura
+reproduce 12.4M:
 
-| reading | params |
+| lectura | params |
 |---|---|
-| literal (ours): 1→64, 64→128, 128→256, 256→512 | **15.82M** |
-| ending at 256 channels | 4.16M |
-| five blocks | 16.07M |
-| `ci→co` on both convs in a block | 10.54M |
+| literal (la nuestra): 1→64, 64→128, 128→256, 256→512 | **15.82M** |
+| terminando en 256 canales | 4.16M |
+| cinco bloques | 16.07M |
+| `ci→co` en ambas convs de un bloque | 10.54M |
 
-**2. FLOPs — the more serious one.** The paper reports 2.86 GFLOPs at 10 s input.
-That is arithmetically unreachable with pooling placed after each block as the
-text describes: block 1 alone at 128×431 costs ~6.9 G, already exceeding the
-reported total. Searching stem strides at 431 frames:
+**2. FLOPs — la más grave.** El paper reporta 2.86 GFLOPs con entrada de 10 s.
+Eso es aritméticamente inalcanzable con el pooling colocado después de cada bloque como
+describe el texto: el bloque 1 solo, a 128×431, cuesta ~6.9 G, superando ya el
+total reportado. Buscando strides de stem a 431 frames:
 
-| pre-block-1 downsample | dual-stream GFLOPs |
+| downsample previo al bloque 1 | GFLOPs de doble flujo |
 |---|---|
-| none (128×431) | 37.13 |
+| ninguno (128×431) | 37.13 |
 | /2 (64×216) | 9.37 |
-| **/4 (32×108)** | **2.32** ← closest to the reported 2.86 |
+| **/4 (32×108)** | **2.32** ← el más cercano al 2.86 reportado |
 | /8 (16×54) | 0.56 |
 
-So the paper must reduce resolution well before block 1. Our literal schedule
-measures 11.2 G at 3 s. Adding a /2 stem pool would give 2.78 G — essentially the
-paper's figure at ~4× less compute — and is the natural next experiment.
+Así que el paper necesariamente reduce la resolución bastante antes del bloque 1. Nuestro
+calendario literal mide 11.2 G a 3 s. Añadir un stem pool de /2 daría 2.78 G — esencialmente
+la cifra del paper con ~4× menos cómputo — y es el siguiente experimento natural.
 
-Neither number was reverse-engineered into the architecture; both are reported as
-measured.
+Ninguno de los dos números se obtuvo por ingeniería inversa a partir de la arquitectura; ambos se
+reportan tal como se midieron.
 
-## Data discipline
+## Disciplina de datos
 
-**Splits are grouped by parent recording.** Adjacent 3 s segments come from the
-same ~58-segment recording and are near-duplicates (same individual, same
-background, seconds apart). A random row split leaks val into train and produces
-flattering, meaningless numbers. `src/splits.py` groups on `site_date_time`
-(1,074 groups) and asserts group and filename disjointness.
+**Los splits están agrupados por grabación padre.** Los segmentos adyacentes de 3 s provienen de la
+misma grabación de ~58 segmentos y son casi duplicados (mismo individuo, mismo
+fondo, a segundos de distancia). Un split aleatorio por filas filtra val dentro de train y produce
+números halagadores y sin sentido. `src/splits.py` agrupa por `site_date_time`
+(1,074 grupos) y verifica la disyunción de grupos y nombres de archivo.
 
-Split: 53,340 train / 8,851 val across 921 / 153 recordings.
+Split: 53,340 train / 8,851 val entre 921 / 153 grabaciones.
 
-**Rare classes.** The head has all 42 logits so indices stay aligned with
-`train.csv`, but headline metrics cover only the **34 species with ≥100
-positives**:
+**Clases raras.** La cabeza tiene los 42 logits para que los índices sigan alineados con
+`train.csv`, pero las métricas principales cubren solo las **34 especies con ≥100
+positivos**:
 
-- `SCIFUS`, `SCINAS` have **zero** positives — AP is undefined, and including
-  them would drag macro-mAP down by 4.8% for no reason.
+- `SCIFUS`, `SCINAS` tienen **cero** positivos — el AP queda indefinido, e incluirlas
+  arrastraría el macro-mAP 4.8% hacia abajo sin ninguna razón.
 - `LEPFLA` (7), `RHISCI` (11), `RHIORN` (21), `LEPELE` (34), `AMEPIC` (68),
-  `SCIRIZ` (73) are reported in a separate table as statistically meaningless.
+  `SCIRIZ` (73) se reportan en una tabla separada como estadísticamente irrelevantes.
 
-**Leave-one-site-out is a 5-class experiment, not 42.** Only `BOAFAB`, `DENMIN`,
-`LEPLAT`, `PHYCUV`, `PITAZU` appear at more than one site; 35 of 42 are
-single-site and none appear at all four. A site-held-out model cannot predict
-species it never saw.
+**Leave-one-site-out es un experimento de 5 clases, no de 42.** Solo `BOAFAB`, `DENMIN`,
+`LEPLAT`, `PHYCUV`, `PITAZU` aparecen en más de un sitio; 35 de 42 son
+de un solo sitio y ninguna aparece en los cuatro. Un modelo con un sitio retenido no puede predecir
+especies que nunca vio.
 
-**Thresholds** are tuned per class on val only, never test. Classes with <5 val
-positives fall back to 0.5 and are flagged.
+**Los umbrales** se ajustan por clase solo en val, nunca en test. Las clases con <5 positivos
+en val recaen en 0.5 y quedan marcadas.
 
-## Why not Ray
+## Por qué no Ray
 
-Considered and rejected for every component, because one machine with one
-non-partitionable GPU removes each value proposition:
+Considerado y rechazado para cada componente, porque una sola máquina con una GPU
+no particionable elimina cada propuesta de valor:
 
-- **Ray Data/Core** for precompute — it is a 16-minute one-shot job;
-  `multiprocessing.Pool` plus a `done` mask gives parallelism and resumability
-  without the object-store serialisation of 66 KB arrays.
-- **Ray Train** — `TorchTrainer` wraps `torch.distributed`, which has **no MPS
-  backend**. Multiple workers on one MPS device time-slice the same command
-  queues and contend rather than speed up.
-- **Ray Tune** — the 4 ablation arms are not a hyperparameter search; all four
-  get reported, so early-stopping them is wrong. Trials would also be forced to
-  concurrency 1.
-- **Ray Serve** — strongest case, since CPU preprocessing (~30 ms HPSS)
-  dominates the forward pass and separating CPU/GPU deployments is a real Serve
-  strength. But `FastAPI` + `ProcessPoolExecutor` captures that locally without
-  running a cluster for one model.
+- **Ray Data/Core** para el precómputo — es un trabajo único de 16 minutos;
+  `multiprocessing.Pool` más una máscara `done` da paralelismo y capacidad de reanudar
+  sin la serialización al object store de arrays de 66 KB.
+- **Ray Train** — `TorchTrainer` envuelve `torch.distributed`, que **no tiene backend
+  MPS**. Varios workers en un mismo dispositivo MPS se reparten en el tiempo las mismas colas
+  de comandos y compiten entre sí en vez de acelerar.
+- **Ray Tune** — los 4 brazos de la ablación no son una búsqueda de hiperparámetros; los cuatro
+  se reportan, así que aplicarles early-stopping sería incorrecto. Los trials además quedarían
+  forzados a concurrencia 1.
+- **Ray Serve** — el caso más fuerte, ya que el preprocesamiento en CPU (~30 ms de HPSS)
+  domina el forward pass y separar los despliegues CPU/GPU es una fortaleza real de
+  Serve. Pero `FastAPI` + `ProcessPoolExecutor` captura eso localmente sin
+  levantar un clúster para un solo modelo.
 
-## MPS notes
+## Notas sobre MPS
 
-MPS is not a separate library — it is a backend inside standard PyTorch
-(`torch.device("mps")`, same `pip install torch`). Practical consequences:
+MPS no es una librería aparte — es un backend dentro de PyTorch estándar
+(`torch.device("mps")`, el mismo `pip install torch`). Consecuencias prácticas:
 
-- `pin_memory=False`: it exists for async DMA over PCIe, which unified memory
-  does not have.
-- fp32 only. Metal has no fp64, and autocast/bf16 are immature.
-- `channels_last` **fails on MPS backward** here (`view size is not compatible…`)
-  — tested and dropped.
-- Reduction order is non-deterministic, so report mean±std over seeds rather
-  than claiming bitwise reproducibility.
-- macOS spawns DataLoader workers, so `h5py` handles cannot be pickled;
-  `AnuraFeatures.__getstate__` drops the handle and each worker reopens lazily.
-- Roughly 3–6× slower than the paper's RTX 3090 for this model.
+- `pin_memory=False`: existe para DMA asíncrono sobre PCIe, que la memoria
+  unificada no tiene.
+- Solo fp32. Metal no tiene fp64, y autocast/bf16 son inmaduros.
+- `channels_last` **falla en el backward de MPS** aquí (`view size is not compatible…`)
+  — probado y descartado.
+- El orden de reducción no es determinista, así que se reporta media±desv. estándar entre semillas
+  en lugar de afirmar reproducibilidad bit a bit.
+- macOS crea los workers del DataLoader con spawn, por lo que los handles de `h5py` no se pueden
+  serializar; `AnuraFeatures.__getstate__` descarta el handle y cada worker lo reabre de forma diferida.
+- Aproximadamente 3–6× más lento que la RTX 3090 del paper para este modelo.
 
-## Verification (`tests/`, all 8 passing)
+## Verificación (`tests/`, los 19 pasando)
 
-The load-bearing one is **overfit-32**: 32 samples, no augmentation, no dropout,
-250 steps. Loss went 0.6925 → 0.000098, confirming the architecture and loss
-wiring are correct. Also checked: output shapes across all arms, param count in
-band, spatial map non-degenerate before attention, fusion weight starts at 0.5
-and receives gradient, no sigmoid in `forward`, SpecAugment bounds, MixUp target
-range.
+El test que carga con el peso es **overfit-32**: 32 muestras, sin aumentación, sin dropout,
+250 pasos. La pérdida pasó de 0.6925 → 0.000098, confirmando que la arquitectura y el cableado
+de la pérdida son correctos. También se verificó: formas de salida en todos los brazos, conteo de params
+en rango, mapa espacial no degenerado antes de la atención, el peso de fusión arranca en 0.5
+y recibe gradiente, sin sigmoide en `forward`, límites de SpecAugment, rango del target de
+MixUp.
 
-Sanity checks on the feature path: HPSS soft-mask property `S_h + S_p == S`
-holds to 1.5e-05, and harmonic components are smoother along time than percussive
-ones in **12/12** clips tested (harmonic freq/time gradient ratio ~1.3 vs
-percussive ~0.4), confirming the decomposition separates horizontal from vertical
-structure as intended.
+Comprobaciones de sanidad en la ruta de features: la propiedad de máscara suave de HPSS `S_h + S_p == S`
+se cumple con error de 1.5e-05, y las componentes armónicas son más suaves en el tiempo que las percusivas
+en **12/12** clips probados (razón de gradiente frecuencia/tiempo armónico ~1.3 vs
+percusivo ~0.4), confirmando que la descomposición separa la estructura horizontal de la
+vertical como se pretende.

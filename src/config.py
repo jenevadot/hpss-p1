@@ -98,7 +98,16 @@ MIXUP_ALPHA = 0.2
 # the model was augmentation-limited rather than capacity-limited. A gate at 0.5
 # lets the model also see clean-ish samples. Set to 1.0 to recover the old
 # behaviour.
-MIXUP_P = 0.5
+#
+# ADOPTED 0.7 (2026-09-04), the one confirmed tuning win in the sweep. Three seeds
+# on the three-way split, against an identically-seeded 0.5 baseline:
+#     mixup_p=0.7   0.7266  0.7212  0.7244   mean 0.7241  sd 0.0027
+#     mixup_p=0.5   0.7151  0.7180  0.6869   mean 0.7067  sd 0.0172
+# +0.0174, winning on 3/3 seeds, and it cuts cross-seed sd by 6x -- it stabilises
+# training as much as it improves it. Pre-registered bar was +0.0078; cleared.
+# mixup_p=0.3 was tested in the same sweep and did nothing (+0.0001), so the
+# direction is real and not a monotone-in-augmentation artefact.
+MIXUP_P = 0.7
 
 # Gradient-norm clipping. MEASURED: the mean pre-clip norm is ~0.13 on the dual
 # arm, so a threshold of 1.0 never fires -- it was paying ~16% per step

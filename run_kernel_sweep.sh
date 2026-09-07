@@ -48,20 +48,42 @@
 # in every file, so a `raw` arm would be a pure no-op control (useful as a sanity
 # check that nothing else drifted between files).
 #
-# Cost per kernel: ~16 min extraction + ~1.2 h training. 3 new kernels (17 already
-# exists as data/features.h5) => ~4.5 h. Disk: 6.2 GB per file, ~19 GB total.
+# Cost per kernel: ~16 min extraction + ~1.2 h training. 4 new kernels (17 already
+# exists as data/features.h5) => ~6 h. Disk: 6.2 GB per file, ~25 GB total.
+#
+# k=5 (116 ms) is included at the user's request and is deliberately past the
+# expected optimum -- it brackets the minimum instead of only approaching it from
+# above, which is what makes a curve rather than a ranking. Its harmonic energy
+# share is already characterised at 0.383.
 set -uo pipefail
 cd "$(dirname "$0")"
 
 export PYTORCH_ENABLE_MPS_FALLBACK=1
-KERNELS="${KERNELS:-9 13 25}"     # 17 is the existing data/features.h5
+KERNELS="${KERNELS:-5 9 13 25}"   # 17 is the existing data/features.h5
 ARM="${ARM:-percussive}"
 EP="${EP:-40}"
 SEED="${SEED:-42}"
 
-echo "=== waiting for any running job (one MPS device) ==="
+# Ordering: this script is FOURTH in the queue, behind run_tuning.sh,
+# run_capacity.sh and run_confirm.sh. Waiting on process absence alone would
+# race run_confirm.sh -- both would see the same clear window and start together
+# on one MPS device. So wait for confirm's ARTIFACTS, then for an idle device.
+CONF_SEEDS="${CONF_SEEDS:-43 44}"
+echo "=== waiting for run_confirm.sh to produce all conf_* summaries ==="
+while :; do
+  missing=""
+  for s in $CONF_SEEDS; do
+    for c in base "mix0.7" "tau0.3"; do
+      [ -f "runs/conf_${c}_s${s}/summary.json" ] || missing="$missing ${c}_s${s}"
+    done
+  done
+  [ -z "$missing" ] && break
+  sleep 120
+done
+echo "=== confirmation complete at $(date +%H:%M); waiting for idle device ==="
 while pgrep -f "run_tuning.sh" >/dev/null 2>&1 \
    || pgrep -f "run_capacity.sh" >/dev/null 2>&1 \
+   || pgrep -f "run_confirm.sh" >/dev/null 2>&1 \
    || pgrep -f "src.train" >/dev/null 2>&1; do
   sleep 60
 done
