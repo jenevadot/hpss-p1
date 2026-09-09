@@ -28,6 +28,10 @@ def set_seed(seed: int) -> None:
                        when no explicit generator is passed.
       torch (MPS)   -- manual_seed already covers all devices; torch.mps has no
                        separate seed function.
+      torch (CUDA)  -- manual_seed also covers CUDA, but torch.cuda.manual_seed_all
+                       is called explicitly below to seed every visible GPU, not
+                       just the current one -- relevant on a multi-GPU box even
+                       though this project only ever targets a single device.
 
     NOT achievable on MPS, and deliberately not claimed: bitwise reproducibility.
     Metal's parallel reduction kernels do not guarantee a fixed summation order and
@@ -36,15 +40,24 @@ def set_seed(seed: int) -> None:
     selection and best-epoch choice. There is no MPS equivalent of
     torch.use_deterministic_algorithms(True) + CUBLAS_WORKSPACE_CONFIG.
 
+    CUDA does not have this limitation -- torch.use_deterministic_algorithms(True)
+    plus CUBLAS_WORKSPACE_CONFIG=:4096:8 gets bitwise-reproducible runs on an
+    NVIDIA GPU, but that determinism mode is NOT enabled here to keep behaviour
+    identical across devices for this replication (same seeding contract,
+    same "report mean+-std over seeds" discipline, regardless of accelerator).
+
     What seeding DOES buy: identical initial weights, identical batch order, and
     identical augmentation draws. That removes every source of run-to-run variance
-    except MPS reduction order, which makes seed-to-seed comparison meaningful and
-    keeps within-seed reruns close (not identical). Report mean+-std over seeds.
+    except reduction order on the accelerator, which makes seed-to-seed comparison
+    meaningful and keeps within-seed reruns close (not identical). Report
+    mean+-std over seeds.
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.backends.mps.is_available():
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    elif torch.backends.mps.is_available():
         # No-op on current PyTorch (manual_seed already covers MPS) but explicit,
         # and correct if a device-specific generator is added later.
         torch.mps.manual_seed(seed)

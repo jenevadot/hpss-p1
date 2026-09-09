@@ -1,4 +1,10 @@
-"""Training / evaluation loop for the HSPP replication on MPS."""
+"""Training / evaluation loop for the HSPP replication.
+
+Runs on whichever accelerator engine.pick_device() finds (CUDA > MPS > CPU) --
+built and measured on Apple Silicon (MPS), with CUDA support added so the same
+code runs unchanged on an NVIDIA GPU. See README.md "Device support" for the
+full comparison and what to re-verify on a CUDA machine.
+"""
 from __future__ import annotations
 
 import json
@@ -17,7 +23,18 @@ from .metrics import summarise, tune_thresholds
 
 
 def pick_device() -> torch.device:
-    """MPS is a backend inside standard PyTorch, not a separate package."""
+    """Pick the best available accelerator: CUDA > MPS > CPU.
+
+    MPS is a backend inside standard PyTorch (torch.device("mps")), not a
+    separate package -- this project was built and measured on Apple Silicon
+    (M4 Pro) and MPS remains the default path there. CUDA is checked FIRST so
+    that on an NVIDIA machine (e.g. running this same code on a lab PC with an
+    RTX GPU) the accelerator is picked up automatically with no code changes,
+    no flags and no MPS-specific calls attempted on a machine that doesn't
+    have Metal. Falls back to CPU only if neither is available.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -43,19 +60,25 @@ def make_loaders(train_ds, val_ds, batch_size=C.BATCH_SIZE, num_workers=0,
 
     Features are precomputed, so a sample is just a small HDF5 read: single-process
     loading measures ~2,500 samples/s against the model's ~66 samples/s on MPS, so
-    the loader is 38x faster than the GPU and workers add only spawn overhead.
+    the loader is 38x faster than the GPU and workers add only spawn overhead. This
+    ratio was only measured on MPS -- on a CUDA machine with a faster GPU it is
+    worth re-measuring whether num_workers>0 pays off before assuming 0 is still
+    best.
 
     `generator` seeds the shuffle independently of the global torch RNG. Without
     it the loader draws from the same RNG that SpecAugment consumes inside
     __getitem__, so batch order would depend on how many augmentation draws had
     happened -- changing SPEC_N_MASKS would silently change the batch order too.
     """
+    # pin_memory speeds up host->device copies via async DMA over PCIe, which is
+    # a real win on a discrete NVIDIA GPU. On Apple unified memory (MPS) there is
+    # no such copy to accelerate, so it would be pure overhead there -- hence
+    # gated on CUDA specifically, not just "any accelerator".
+    pin_memory = torch.cuda.is_available()
     common = dict(
         batch_size=batch_size,
         num_workers=num_workers,
-        # pin_memory is a CUDA host-memory concept for async DMA over PCIe. On
-        # Apple unified memory there is no such copy, so it is pure overhead.
-        pin_memory=False,
+        pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
         worker_init_fn=seed_worker if num_workers > 0 else None,
     )

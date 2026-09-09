@@ -3,8 +3,9 @@
 Design rationale (plan section 6): the inference path is
   raw audio -> STFT -> HPSS (~30 ms CPU) -> mel -> forward
 so CPU preprocessing, not the model, dominates. HPSS therefore runs in a process
-pool while MPS inference is serialised behind a lock -- there is one GPU and
-concurrent submissions contend rather than overlap.
+pool while accelerator inference (MPS or CUDA, whichever pick_device() finds) is
+serialised behind a lock -- there is one GPU and concurrent submissions contend
+rather than overlap.
 
 Ray Serve was considered and rejected: splitting CPU-preprocess from GPU-model
 deployments is a genuine Serve strength, but running a cluster to serve one model
@@ -29,11 +30,12 @@ from . import config as C
 # The SAME feature function used by precompute. Importing it (rather than
 # reimplementing) is what prevents train/serve feature skew, which degrades
 # predictions silently with no error.
+from .engine import pick_device
 from .features import features_from_path
 from .model import HSPPNet
 
 STATE: dict = {}
-_MPS_LOCK = asyncio.Lock()
+_ACCEL_LOCK = asyncio.Lock()  # serialises access to the single GPU (MPS or CUDA)
 
 
 def _load_checkpoint(run_dir: Path):
@@ -43,7 +45,7 @@ def _load_checkpoint(run_dir: Path):
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = pick_device()
     model.to(device)
 
     thresh_path = run_dir / "thresholds.npy"
@@ -112,7 +114,7 @@ async def predict(file: UploadFile = File(...), top_k: int = 10):
         t_p = torch.from_numpy(x_p)[None, None].to(device)
 
         # One GPU: serialise forward passes rather than letting them contend.
-        async with _MPS_LOCK:
+        async with _ACCEL_LOCK:
             with torch.no_grad():
                 logits = model(t_h, t_p) if arm == "dual" else model(t_h)
                 probs = torch.sigmoid(logits)[0].cpu().numpy()

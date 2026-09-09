@@ -1,0 +1,25 @@
+# Dependencies for the HSPP replication on AnuraSet.
+#
+# torch/torchaudio are installed WITHOUT a pinned CUDA/CPU build here on
+# purpose: the correct wheel depends on the host's accelerator (Apple Silicon
+# MPS vs NVIDIA CUDA vs CPU-only) and pip resolves that automatically from
+# PyPI's platform tags on macOS. On a CUDA machine, install torch first from
+# the appropriate index (see README.md "Device support: NVIDIA / CUDA") BEFORE
+# installing this file, so pip does not fall back to a CPU-only wheel.
+torch>=2.2
+torchaudio>=2.2
+librosa>=0.10
+soundfile
+numpy<2.1
+pandas
+scikit-learn
+h5py
+tqdm
+tensorboard
+thop
+matplotlib
+seaborn
+fastapi
+uvicorn
+python-multipart
+pytest

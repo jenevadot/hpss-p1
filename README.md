@@ -12,18 +12,124 @@ liviana y la posiciona *frente a* AST (12.4M vs 86M params, 24.1 ms vs
 
 ## Instalación
 
+**Opción A — script de setup (recomendada, hace todo lo de abajo en un paso):**
+
+```bash
+./setup.sh
+```
+
+Crea `.venv`, instala `requirements.txt`, extrae los datos, corre `src.splits`,
+precomputa `data/features.h5` y ejecuta la suite de tests — cada paso es
+idempotente (se puede re-ejecutar sin duplicar trabajo). Usa
+`PYTHON_BIN=/ruta/a/python3.11 ./setup.sh` si Python 3.11 no está en
+`~/.local/bin/python3.11`.
+
+**Opción B — pasos manuales:**
+
 ```bash
 uv venv --python ~/.local/bin/python3.11 .venv
-VIRTUAL_ENV=.venv uv pip install "torch>=2.2" torchaudio "librosa>=0.10" soundfile \
-    "numpy<2.1" pandas scikit-learn h5py tqdm tensorboard thop matplotlib seaborn \
-    fastapi uvicorn python-multipart pytest
+VIRTUAL_ENV=.venv uv pip install -r requirements.txt
 
 tar -xf train.7z -C data/          # 62,191 clips, 7.7 GB
 tar -xf test.7z  -C data/          # 31,187 clips (las etiquetas vienen del origen, más abajo)
 ```
 
-Python 3.11 está fijado deliberadamente: 3.14 no tiene wheels confiables de torch,
-y librosa necesita numba, que se retrasa respecto a las versiones nuevas de CPython.
+`requirements.txt` fija todas las dependencias del proyecto (torch, torchaudio,
+librosa, h5py, fastapi, etc.). Python 3.11 está fijado deliberadamente: 3.14 no
+tiene wheels confiables de torch, y librosa necesita numba, que se retrasa
+respecto a las versiones nuevas de CPython.
+
+### Dónde va la data
+
+El repo espera esta estructura relativa a la raíz del proyecto (todo bajo
+`data/`, definido en `src/config.py`):
+
+```
+paper1/
+├── train.7z, test.7z            # archivos comprimidos, se extraen a data/
+├── train.csv                    # metadata de entrenamiento (nombre, etiquetas)
+├── test_files.csv               # lista de archivos de test
+├── AnuraSet_v1.0.0/
+│   ├── audio/…                  # wavs crudos por sitio/fecha (para score_test.py)
+│   └── metadata.csv             # etiquetas oficiales del test upstream, col. `subset`
+└── data/
+    ├── train/                   # extraído de train.7z — wavs de entrenamiento
+    ├── test/                    # extraído de test.7z  — wavs de test (sin CSV de labels)
+    ├── splits/                  # generado por `python -m src.splits`
+    ├── features.h5              # generado por `python -m src.precompute` (5.8 GB)
+    └── features_test.h5         # generado por `python -m src.precompute` sobre data/test
+```
+
+Ningún script crea `train.7z` / `test.7z` / `AnuraSet_v1.0.0/` por sí mismo —
+esos deben colocarse manualmente en la raíz del repo antes de correr
+`./setup.sh` o los pasos manuales. Todo lo que cuelga de `data/` (splits,
+`.h5`) sí se genera automáticamente y los scripts de precompute/split detectan
+si ya existe para no repetir trabajo.
+
+## Device support: Apple Silicon (MPS) y NVIDIA (CUDA)
+
+El código se desarrolló y midió en Apple Silicon (M4 Pro) usando el backend
+**MPS** de PyTorch, y esa sigue siendo la ruta por defecto en esa máquina — no
+se cambió nada de esa configuración. Se agregó soporte **condicional** para
+GPUs NVIDIA (CUDA) para poder correr exactamente el mismo código sin
+modificaciones en otra computadora con una tarjeta NVIDIA.
+
+**Selección automática de dispositivo (`src/engine.py::pick_device`):**
+
+```python
+def pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+```
+
+El orden es **CUDA → MPS → CPU**. En la Mac (sin CUDA disponible) esto elige
+`mps` exactamente como antes. En una máquina con GPU NVIDIA, elige `cuda`
+automáticamente — sin flags, sin variables de entorno, sin tocar `train.py`,
+`serve.py` ni `predict_test.py` (los tres llaman a `pick_device()` en vez de
+hardcodear `"mps"`).
+
+**Qué cambia según el dispositivo, sin intervención manual:**
+
+| Comportamiento | MPS (Apple Silicon) | CUDA (NVIDIA) |
+|---|---|---|
+| `pin_memory` en el DataLoader | `False` (memoria unificada, no hay copia DMA que aceleres) | `True` (acelera la copia host→GPU sobre PCIe) |
+| Semillado (`train.set_seed`) | `torch.mps.manual_seed` (no-op explícito) | `torch.cuda.manual_seed_all` (cubre todas las GPUs visibles) |
+| Reproducibilidad bit a bit | No alcanzable — el orden de reducción de Metal no es fijo | Alcanzable con `torch.use_deterministic_algorithms(True)` + `CUBLAS_WORKSPACE_CONFIG`, pero **no se activa** aquí a propósito, para mantener el mismo contrato de "media±sd entre semillas" en ambos dispositivos |
+| `channels_last` | Falla en el backward de MPS (probado y descartado) | No probado en este proyecto; en general sí soportado en CUDA — pendiente de validar si se usa esa máquina para más que una corrida de humo |
+| Precisión | Solo fp32 (Metal no tiene fp64; autocast/bf16 no ganan nada en MPS, ver medición abajo) | fp32 por defecto igual que en MPS; autocast/AMP en CUDA sí suele acelerar (no medido todavía en este repo — pendiente al validar en la máquina nueva) |
+
+**Instalar el wheel de torch correcto en la máquina NVIDIA:** `requirements.txt`
+no fija una build de CUDA específica porque el wheel correcto depende de la
+versión del driver de esa máquina. Antes de `uv pip install -r
+requirements.txt`, instalar torch con el índice de PyTorch para la versión de
+CUDA disponible, por ejemplo:
+
+```bash
+# Ejemplo para CUDA 12.1 -- ajustar cu121 según `nvidia-smi` / la política del
+# entorno de destino. Ver https://pytorch.org/get-started/locally/
+VIRTUAL_ENV=.venv uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+VIRTUAL_ENV=.venv uv pip install -r requirements.txt   # el resto de dependencias
+```
+
+Instalando torch primero con el índice CUDA, el `torch>=2.2` de
+`requirements.txt` ya está satisfecho y `uv` no lo reemplaza por un wheel
+CPU-only.
+
+**Verificar qué dispositivo se detectó** antes de lanzar un entrenamiento largo:
+
+```bash
+.venv/bin/python -c "from src.engine import pick_device; print(pick_device())"
+```
+
+**Qué falta re-medir en la máquina NVIDIA (no asumir que los números de MPS
+transfieren):** los tiempos por época de la sección "Medido en esta máquina"
+más abajo, si `num_workers=0` sigue siendo óptimo (el ratio DataLoader/modelo
+que lo justifica fue medido solo contra el throughput de MPS), y si autocast/AMP
+sí aporta una ganancia real en CUDA — a diferencia de MPS, donde se midió y
+se descartó explícitamente.
 
 ## Pipeline
 
@@ -192,7 +298,10 @@ no particionable elimina cada propuesta de valor:
 ## Notas sobre MPS
 
 MPS no es una librería aparte — es un backend dentro de PyTorch estándar
-(`torch.device("mps")`, el mismo `pip install torch`). Consecuencias prácticas:
+(`torch.device("mps")`, el mismo `pip install torch`). Esta sección documenta
+el comportamiento medido en la máquina Apple Silicon; ver la sección
+"Device support: Apple Silicon (MPS) y NVIDIA (CUDA)" más arriba para cómo el
+mismo código se comporta en una GPU NVIDIA. Consecuencias prácticas de MPS:
 
 - `pin_memory=False`: existe para DMA asíncrono sobre PCIe, que la memoria
   unificada no tiene.
